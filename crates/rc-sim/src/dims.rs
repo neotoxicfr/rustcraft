@@ -1,0 +1,1413 @@
+//! Several dimensions loaded at the same time (S6): the player's dimension lives in the
+//! server fields (`dim`, `chunks`, `bs`…), the others are "parked" here with their
+//! chunks, tick queues, mobs, items, furnaces and generator, and exchanged by
+//! `mem::swap` as needed (save, entities going through a portal, player dimension
+//! change). Player dimension change like the official 26.3 server: `respawn`
+//! (data kept), difficulty, operator level, position, abilities, world info
+//! (border, time, spawn point, rain, chunk wait), inventory, sound.
+
+use hashbrown::HashMap;
+use std::collections::BTreeSet;
+
+use rc_client::{EntityEvent, Event};
+use rc_proto::nbt::Nbt;
+
+use crate::blocks::P;
+use crate::chunk::Chunk;
+use crate::nbtio;
+use crate::server::Server;
+use crate::world::Dimension;
+
+pub(crate) const OVERWORLD: &str = "minecraft:overworld";
+pub(crate) const NETHER: &str = "minecraft:the_nether";
+pub(crate) const END: &str = "minecraft:the_end";
+
+/// Relative flags of the position packet.
+pub(crate) mod rel {
+    pub const Y_ROT: i32 = 1 << 3;
+    pub const X_ROT: i32 = 1 << 4;
+    pub const ROTATION: i32 = Y_ROT | X_ROT;
+    /// Velocity kept (three axes) and rotated with the yaw.
+    pub const DELTA: i32 = (1 << 5) | (1 << 6) | (1 << 7) | (1 << 8);
+}
+
+/// Entity an entity packet is about; `None` for a removal list (entities of a world).
+fn entity_event_subject(e: &EntityEvent) -> Option<i32> {
+    match e {
+        EntityEvent::Add(a) => Some(a.id),
+        EntityEvent::Remove(_) => None,
+        EntityEvent::Move(m) => Some(m.id),
+        EntityEvent::Teleport(t) => Some(t.id),
+        EntityEvent::Sync(s) => Some(s.id),
+        EntityEvent::Passengers { vehicle: id, .. }
+        | EntityEvent::Head { id, .. }
+        | EntityEvent::Motion { id, .. }
+        | EntityEvent::Data { id, .. }
+        | EntityEvent::Equipment { id, .. }
+        | EntityEvent::Event { id, .. }
+        | EntityEvent::Swing { id, .. }
+        | EntityEvent::Hurt { id, .. }
+        | EntityEvent::Damage { id, .. }
+        | EntityEvent::Effect { id, .. }
+        | EntityEvent::RemoveEffect { id, .. }
+        | EntityEvent::Animate { id, .. } => Some(*id),
+    }
+}
+
+/// World of a dimension, parked while the player is elsewhere.
+pub(crate) struct World {
+    pub dim: Dimension,
+    pub chunks: HashMap<(i32, i32), Option<Box<Chunk>>>,
+    pub entities: HashMap<(i32, i32), Vec<(i32, Nbt)>>,
+    /// Hints into `entities`, parked with them (one index for two dimensions' lists kept the
+    /// entries of both and rebuilt for each).
+    pub kept_index: crate::commands::kept_entity_index::KeptEntityIndex,
+    /// Entity chunks too old to convert, parked with the entities.
+    pub too_old_entity_chunks: hashbrown::HashSet<(i32, i32)>,
+    pub bs: crate::blocks::level::Sim,
+    pub generator: Option<crate::generation::Gen>,
+    /// Mobs (only the list, the arrows, the chunks read and the world's random draw are used).
+    pub mobs: Box<crate::mobs::Mobs>,
+    /// Simulated decorations of the dimension.
+    pub deco: Box<crate::decoration::Decos>,
+    pub drops: Vec<crate::drops::ItemEnt>,
+    pub drop_chunks: BTreeSet<(i32, i32)>,
+    pub orbs: Vec<crate::drops::Orb>,
+    pub furnaces: HashMap<[i32; 3], crate::containers::Furnace>,
+    /// G3-F13: brewing stands of the dimension (their tickers are in `bs`).
+    pub brewers: HashMap<[i32; 3], crate::brewing::Brewer>,
+    pub changed: Vec<P>,
+    pub pending_light_updates: Vec<Event>,
+    pub relight: Vec<P>,
+    /// `relight` positions that touch the sky (C2-M04).
+    pub relight_sky: Vec<P>,
+    /// Portal tickets of the dimension (the chunks around a portal arrival, 300 ticks).
+    pub(crate) portal_tickets: PortalTickets,
+    /// S8: projectiles and clouds of the dimension.
+    pub proj: Box<crate::projectiles::Projs>,
+    /// G5-F06: minecarts of the dimension.
+    pub carts: Box<crate::minecart::Carts>,
+    /// L9-TICK: evoker fangs of the dimension (before, they followed the player and bit at the
+    /// same coordinates in the arrival dimension).
+    pub fangs: Vec<crate::mobs::illagers::spells::Fangs>,
+    /// L9-TICK: signs of the dimension being edited (player allowed to send their text): the
+    /// game keeps the editor on the sign itself, so a sign at the same coordinates elsewhere
+    /// refuses the text.
+    pub sign_editors: HashMap<[i32; 3], u128>,
+    /// L10-ORDER: entities of the dimension outside the entity list (`walk::Walk::left`).
+    pub left: Vec<(crate::walk::Fam, u64)>,
+    /// L10-ORDER: families swept out of the list while parked (`walk::Walk::swept`).
+    pub swept: u16,
+    /// Force-loaded chunks of the dimension (`forceload`) and whether they changed since their
+    /// last save: each world keeps its own, like the game's per-world chunk tickets.
+    pub forced: BTreeSet<(i32, i32)>,
+    pub forced_dirty: bool,
+    /// Sleep status of the dimension (active players, in bed among them): each world counts its
+    /// own players and decides its own night skip, like the game's.
+    pub sleep: (i32, i32),
+}
+
+/// World generation settings (`data/minecraft/world_gen_settings.dat`): seed, and for
+/// each dimension its type and generator. Read once when the world is opened (and re-read on
+/// `/reload`) instead of at each question: the file is only written at world creation, so the
+/// answer is the same as if it were re-read.
+#[derive(Default)]
+pub(crate) struct GenSettings {
+    root: Option<Nbt>,
+    /// Hashed seed of the biome zoom (the one the client receives), computed once.
+    pub zoom_seed: i64,
+}
+
+impl GenSettings {
+    pub fn read(world: &std::path::Path) -> GenSettings {
+        let mut g = GenSettings {
+            root: nbtio::read_dat(&world.join("data").join("minecraft").join("world_gen_settings.dat")).ok(),
+            zoom_seed: 0,
+        };
+        g.zoom_seed = crate::server::sha256_seed(g.seed());
+        g
+    }
+
+    /// These settings with the dimensions the data packs declare (`data/<ns>/dimension/`) merged
+    /// in, as the game builds a world's dimensions when it opens: a pack's definition replaces the
+    /// saved one of the same name, a new one adds a dimension.
+    pub fn with_pack_dimensions(mut self, pack: &crate::datapack::DataPack) -> GenSettings {
+        let declared = pack.all("dimension");
+        if declared.is_empty() {
+            return self;
+        }
+        let root = self.root.get_or_insert_with(|| Nbt::Compound(Vec::new()));
+        if root.get("data").is_none() {
+            nbtio::set(root, "data", Nbt::Compound(Vec::new()));
+        }
+        let Some(data) = nbtio::get_mut(root, "data") else { return self };
+        if data.get("dimensions").is_none() {
+            nbtio::set(data, "dimensions", Nbt::Compound(Vec::new()));
+        }
+        if let Some(dimensions) = nbtio::get_mut(data, "dimensions") {
+            for (name, definition) in declared {
+                nbtio::set(dimensions, &name, crate::recipes::json_to_nbt(&definition));
+            }
+        }
+        self
+    }
+
+    /// `data` compound.
+    pub fn data(&self) -> Option<&Nbt> {
+        self.root.as_ref()?.get("data")
+    }
+
+    /// World seed (0 if unreadable).
+    pub fn seed(&self) -> i64 {
+        self.data().and_then(|d| d.get("seed")?.as_i64()).unwrap_or(0)
+    }
+
+    /// Dimensions of the world: the game's three, then those of the settings (data packs).
+    pub fn dimension_names(&self) -> Vec<String> {
+        let mut out: Vec<String> = crate::server::DIMENSIONS.iter().map(|d| (*d).to_owned()).collect();
+        if let Some(Nbt::Compound(f)) = self.data().and_then(|d| d.get("dimensions")) {
+            let mut extra: Vec<String> = f.iter().map(|(k, _)| k.clone()).filter(|k| !out.contains(k)).collect();
+            extra.sort();
+            out.extend(extra);
+        }
+        out
+    }
+
+    /// Compound of a dimension (`dimensions.<name>`).
+    fn dimension(&self, name: &str) -> Option<&Nbt> {
+        self.data()?.get("dimensions")?.get(name)
+    }
+
+    /// Dimension type (its name by default).
+    pub fn dimension_type<'a>(&'a self, name: &'a str) -> &'a str {
+        self.dimension(name).and_then(|d| d.get("type")?.as_str()).unwrap_or(name)
+    }
+
+    /// Tests: a data pack dimension `name` of type `ty` added to the settings.
+    #[cfg(test)]
+    pub(crate) fn add_dimension_for_test(&mut self, name: &str, ty: &str) {
+        let root = self.root.get_or_insert_with(|| Nbt::Compound(Vec::new()));
+        if root.get("data").is_none() {
+            nbtio::set(root, "data", Nbt::Compound(Vec::new()));
+        }
+        let data = nbtio::get_mut(root, "data").expect("data compound");
+        if data.get("dimensions").is_none() {
+            nbtio::set(data, "dimensions", Nbt::Compound(Vec::new()));
+        }
+        let dims = nbtio::get_mut(data, "dimensions").expect("dimensions compound");
+        nbtio::set(dims, name, Nbt::Compound(vec![("type".into(), Nbt::String(ty.into()))]));
+    }
+
+    /// Flat generator (`minecraft:flat`).
+    pub fn is_flat(&self, name: &str) -> bool {
+        self.dimension(name).and_then(|d| d.get("generator")?.get("type")?.as_str()) == Some("minecraft:flat")
+    }
+}
+
+/// Portal tickets of a world: an entity arriving through a portal keeps the chunks around its
+/// arrival simulated for 300 ticks, the countdown starting again at each arrival in the same
+/// chunk. At its own chunk a ticket has level 30 (full level 33 − radius 3): entities tick one
+/// chunk around, blocks two around, chunks stay loaded three around. A world nobody stands in
+/// ticks in full while it holds one, its ticking limited to those chunks by their level.
+#[derive(Debug, Default)]
+pub(crate) struct PortalTickets {
+    list: Vec<PortalTicket>,
+    /// Game time of the last purge: a world purges once per tick.
+    purged: Option<i64>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PortalTicket {
+    chunk: (i32, i32),
+    /// Purges left: counted down once per tick of its world, removed below 0.
+    left: i32,
+    /// Applied (from the tick after the one that created it, like every ticket).
+    live: bool,
+}
+
+/// Level of a portal ticket at its own chunk.
+pub(crate) const PORTAL_TICKET_LEVEL: i32 = 30;
+/// Lifetime of a portal ticket after its last renewal.
+const PORTAL_TICKET_TIMEOUT: i32 = 300;
+/// Chunks a portal ticket keeps loaded around its own (full level 33 reached three away).
+pub(crate) const PORTAL_TICKET_LOADED_RADIUS: i32 = 3;
+
+impl PortalTickets {
+    /// A ticket at `chunk`: a new one, or the one already there renewed.
+    pub(crate) fn place(&mut self, chunk: (i32, i32)) {
+        match self.list.iter_mut().find(|t| t.chunk == chunk) {
+            Some(t) => t.left = PORTAL_TICKET_TIMEOUT,
+            None => self.list.push(PortalTicket { chunk, left: PORTAL_TICKET_TIMEOUT, live: false }),
+        }
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.list.is_empty()
+    }
+
+    /// Between two ticks: the tickets created during the previous one apply.
+    pub(crate) fn apply(&mut self) {
+        for t in &mut self.list {
+            t.live = true;
+        }
+    }
+
+    /// Purge of the chunk source (once per ticking tick of the world, `now`: game time): one tick
+    /// less, expired ones removed.
+    pub(crate) fn purge(&mut self, now: i64) {
+        if self.purged.replace(now) == Some(now) {
+            return;
+        }
+        self.list.retain_mut(|t| {
+            t.left -= 1;
+            t.left >= 0
+        });
+    }
+
+    /// Lowest level of the applied tickets at chunk `c` (`i32::MAX` without any).
+    pub(crate) fn level(&self, c: (i32, i32)) -> i32 {
+        let mut lvl = i32::MAX;
+        for t in self.list.iter().filter(|t| t.live) {
+            let d = (c.0 - t.chunk.0).abs().max((c.1 - t.chunk.1).abs());
+            lvl = lvl.min(PORTAL_TICKET_LEVEL.saturating_add(d));
+        }
+        lvl
+    }
+
+    /// Chunks of the applied tickets.
+    pub(crate) fn live_chunks(&self) -> impl Iterator<Item = (i32, i32)> + '_ {
+        self.list.iter().filter(|t| t.live).map(|t| t.chunk)
+    }
+}
+
+/// Portal traversed (the game compares the block object: one process per kind of portal).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PortalKind {
+    Nether,
+    End,
+    Gateway,
+}
+
+/// Portal process of an entity.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Proc {
+    pub kind: PortalKind,
+    pub entry: P,
+    pub time: i32,
+    pub inside: bool,
+}
+
+impl Proc {
+    /// True when the delay is reached.
+    pub fn process(&mut self, allowed: bool, delay: i32) -> bool {
+        if !self.inside {
+            self.time = (self.time - 4).max(0);
+            return false;
+        }
+        self.inside = false;
+        if !allowed {
+            return false;
+        }
+        let t = self.time;
+        self.time += 1;
+        t >= delay
+    }
+
+    pub fn expired(&self) -> bool {
+        self.time <= 0
+    }
+}
+
+/// Portal state of an entity (return delay and process).
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct EntPortal {
+    pub cooldown: i32,
+    pub proc: Option<Proc>,
+}
+
+impl EntPortal {
+    /// The "in a portal" mark.
+    pub fn set_inside(&mut self, kind: PortalKind, p: P, delay_after: i32) {
+        if self.cooldown > 0 {
+            self.cooldown = delay_after;
+            return;
+        }
+        match &mut self.proc {
+            Some(pr) if pr.kind == kind => {
+                if !pr.inside {
+                    pr.entry = p;
+                    pr.inside = true;
+                }
+            }
+            _ => self.proc = Some(Proc { kind, entry: p, time: 0, inside: true }),
+        }
+    }
+}
+
+/// Respawn packet flag: the client keeps its player's attribute modifiers.
+pub(crate) const KEEP_ATTRIBUTE_MODIFIERS: u8 = 1;
+/// Respawn packet flags: the client keeps its player's attribute modifiers and synced values.
+pub(crate) const KEEP_ALL_DATA: u8 = 3;
+
+/// Destination of a passage.
+#[derive(Debug, Clone)]
+pub(crate) struct Transition {
+    pub dim: String,
+    pub pos: [f64; 3],
+    pub yaw: f32,
+    pub pitch: f32,
+    /// `rel::*` flags: rotation added, velocity kept.
+    pub relative: i32,
+    /// Travel sound (event 1032) to the player.
+    pub sound: bool,
+    /// Portal ticket placed on arrival, and where.
+    pub ticket: Option<TicketSpot>,
+    /// Respawn: respawn block missing (event 0).
+    pub missing_respawn: bool,
+}
+
+/// Where a passage places its portal ticket on arrival.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TicketSpot {
+    /// At the chunk of the arrival position: a Nether portal just built, the End, a gateway.
+    AtArrival,
+    /// At the chunk of the existing Nether portal block found nearest the target, which can be
+    /// another chunk than the arrival's on a wide portal.
+    AtPortalBlock([i32; 3]),
+}
+
+impl Transition {
+    /// Position whose chunk holds this passage's portal ticket, if it places one.
+    pub(crate) fn ticket_pos(&self) -> Option<[f64; 3]> {
+        self.ticket.map(|ticket| match ticket {
+            TicketSpot::AtArrival => self.pos,
+            TicketSpot::AtPortalBlock(block) => block.map(f64::from),
+        })
+    }
+}
+
+/// Tracking of a world nobody stands in any more forgotten: its entities announced again to
+/// whoever enters it, its wither bars (shown no longer) added to `bars`, and its entities leave
+/// the list on its next tick (`walk_park_sweep`).
+fn forget_parked_world_tracking(w: &mut World, bars: &mut Vec<u128>) {
+    for m in w.mobs.list.iter_mut() {
+        m.track.forget_observers();
+        if std::mem::take(&mut m.wither.bar_shown) {
+            bars.push(m.wither.bar);
+        }
+    }
+    // S8: projectiles and clouds; L9-TICK: fangs (`enter_world` already swapped them out).
+    for p in &mut w.proj.list {
+        p.track.seen = false;
+    }
+    for c in &mut w.proj.clouds {
+        c.seen = false;
+    }
+    for f in &mut w.fangs {
+        f.seen = false;
+    }
+    // G5-F06: minecarts.
+    for c in w.carts.list.iter_mut().flatten() {
+        c.track.seen = false;
+    }
+    // L10-ORDER.
+    w.swept = 0;
+}
+
+/// A world other than the one `game_tick` simulated, simulated in full this tick, and who is
+/// installed for its tick.
+pub(crate) struct WorldAway {
+    name: String,
+    ticker: WorldTicker,
+}
+
+/// The player installed for the tick of a [`WorldAway`].
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WorldTicker {
+    /// The first guest seated among those standing there: its own phases run in that tick.
+    Guest(usize),
+    /// The host, sent there by a command during the tick of the world it left: its own phases,
+    /// skipped in that world, run in this one, which the game ticks after with the host present.
+    HostArrived,
+    /// Nobody stands there (force-loaded chunks): the installed player is hidden.
+    Nobody,
+}
+
+impl WorldAway {
+    /// World `name` ticks its raids with its blocks (a player stands there).
+    pub(crate) fn ticks_raids_itself(&self, name: &str) -> bool {
+        self.ticker != WorldTicker::Nobody && self.name == name
+    }
+}
+
+/// The tick of a world in progress ([`Server::begin_world_tick`]).
+#[derive(Default)]
+pub(crate) struct RunningWorldTick {
+    pub running: bool,
+    /// The world ticking (kept string: nothing allocated per tick).
+    pub world: String,
+    /// The player installed for that tick (its LAN seat, `None`: the host). Another player moved
+    /// meanwhile is installed for its own move only, which brings the server back by itself.
+    pub seat: Option<usize>,
+    /// The installed player, if it changed world during that tick.
+    pub player_left: Option<PlayerLeftDuringTick>,
+}
+
+/// A player who changed world during the tick of the world it left, hidden from that world until
+/// its tick ends: what to put back then.
+pub(crate) struct PlayerLeftDuringTick {
+    /// Whether this departure hid the player (not already hidden by an outer tick).
+    hid_the_player: bool,
+    muted: bool,
+    home: Option<String>,
+    home_pos: [f64; 3],
+}
+
+/// The installed player's fields that [`Server::hide_player`] changes, to put back.
+pub(crate) struct HiddenPlayer {
+    pos: [f64; 3],
+    loaded: bool,
+    joined_tick: u64,
+}
+
+/// Dimensions and "portals" state of the player.
+#[derive(Default)]
+pub(crate) struct Dims {
+    pub parked: Vec<World>,
+    /// Player: portal process, return delay (`PortalCooldown`).
+    pub player: EntPortal,
+    pub seen_credits: bool,
+    pub won_game: bool,
+    pub entered_nether: Option<[f64; 3]>,
+    /// Other entities (items, falling blocks, mobs) by identifier.
+    pub ents: HashMap<i32, EntPortal>,
+    /// End gateway delays: (dimension, position) → remaining ticks.
+    pub gateways: HashMap<(String, P), i32>,
+    /// Player fields read.
+    pub read: bool,
+    /// During the tick of a parked dimension: real dimension and position of the player.
+    pub home: Option<String>,
+    pub home_pos: [f64; 3],
+    /// While a command run in another world hurts the player ([`Server::hurt_player_from_command`]):
+    /// that world, which the game hands to the hit.
+    pub hit_from_world: Option<String>,
+    /// Player pearls that fell into a parked dimension: (dimension, arrival point, pearl on
+    /// return delay), teleportations done on return to its dimension.
+    pub pearl_jumps: Vec<(String, [f64; 3], bool)>,
+    /// The world `game_tick` simulated this tick (noted where its world part starts; empty before
+    /// the first tick): once the host left it during the tick (portal, teleport), `dims_tick` must
+    /// not tick it again, and must tick the world the host reached.
+    pub world_ticked_by_game_tick: String,
+    /// The world whose tick runs now, and the current player if it left that world meanwhile.
+    pub running_tick: RunningWorldTick,
+    /// Whether the host left its world by a command during that world's tick, this tick: the
+    /// world it reached then ticks with the host present ([`WorldTicker::HostArrived`]).
+    pub host_left_during_world_tick: bool,
+    /// The installed player's real state while it is hidden from the tick of a world it does not
+    /// stand in ([`Server::hide_player`]).
+    pub hidden_player: Option<HiddenPlayer>,
+}
+
+impl Server {
+    /// Swaps the active world with `w`.
+    pub(crate) fn exchange(&mut self, w: &mut World) {
+        use std::mem::swap;
+        self.light_guard(crate::light_async::Site::Exchange);
+        self.end_on_park(); // F15: dragon bar removed when leaving the dimension
+        self.raids_on_park(); // L10-ENT: same for the raid bars
+        self.swap_active_border(&w.dim.name); // each dimension's own border
+        swap(&mut self.dim, &mut w.dim);
+        swap(&mut self.chunks, &mut w.chunks);
+        self.chunk_map_swaps += 1;
+        swap(&mut self.entities, &mut w.entities);
+        swap(&mut self.kept_index, &mut w.kept_index);
+        swap(&mut self.too_old_entity_chunks, &mut w.too_old_entity_chunks);
+        swap(&mut self.bs, &mut w.bs);
+        swap(&mut self.generator, &mut w.generator);
+        swap(&mut self.mobs.list, &mut w.mobs.list);
+        swap(&mut self.mobs.index, &mut w.mobs.index);
+        swap(&mut self.mobs.adopted, &mut w.mobs.adopted);
+        swap(&mut self.mobs.rng, &mut w.mobs.rng);
+        // Mobs (F04-F06): projectiles and lightning bolts specific to the world, points of interest.
+        swap(&mut self.mobs.mounts.spits, &mut w.mobs.mounts.spits);
+        swap(&mut self.mobs.mounts.bolts, &mut w.mobs.mounts.bolts);
+        swap(&mut self.mobs.poi, &mut w.mobs.poi);
+        swap(&mut self.mobs.end, &mut w.mobs.end); // F15: crystals, dragon fight
+        swap(&mut self.mobs.ill.raids, &mut w.mobs.ill.raids); // L10-ENT: raids of the dimension
+        // G3-F13: state of the block entities whose tickers live in `bs` (rung bells, vaults,
+        // ominous item spawners), kept with their dimension.
+        swap(&mut self.mobs.bells, &mut w.mobs.bells);
+        swap(&mut self.mobs.spawners.blocks, &mut w.mobs.spawners.blocks);
+        swap(&mut self.life.drops, &mut w.drops);
+        swap(&mut self.life.drop_chunks, &mut w.drop_chunks);
+        swap(&mut self.life.orbs, &mut w.orbs);
+        swap(&mut self.life.furnaces, &mut w.furnaces);
+        swap(&mut self.life.brewers, &mut w.brewers); // G3-F13
+        swap(&mut self.changed, &mut w.changed);
+        swap(&mut self.pending_light_updates, &mut w.pending_light_updates);
+        swap(&mut self.relight, &mut w.relight);
+        swap(&mut self.relight_sky, &mut w.relight_sky);
+        swap(&mut self.proj, &mut w.proj); // S8: projectiles
+        swap(&mut self.carts, &mut w.carts); // G5-F06: minecarts
+        swap(&mut self.deco, &mut w.deco); // decorations
+        swap(&mut self.mobs.ill.fangs, &mut w.fangs); // L9-TICK
+        swap(&mut self.life.sign_editors, &mut w.sign_editors); // L9-TICK
+        swap(&mut self.walk.left, &mut w.left); // L10-ORDER
+        swap(&mut self.walk.swept, &mut w.swept);
+        swap(&mut self.cmd.forced, &mut w.forced);
+        swap(&mut self.cmd.forced_dirty, &mut w.forced_dirty);
+        swap(&mut self.portal_tickets, &mut w.portal_tickets);
+        swap(&mut self.life.weather.sleep, &mut w.sleep);
+    }
+
+    pub(crate) fn world_seed(&self) -> i64 {
+        self.wgs.seed()
+    }
+
+    /// Dimensions of the world: the game's three, then those of the settings (data packs).
+    pub(crate) fn world_dimensions(&self) -> Vec<String> {
+        self.wgs.dimension_names()
+    }
+
+    /// Dimension type of a dimension (world settings, otherwise its name).
+    pub(crate) fn dimension_type_of(&self, name: &str) -> String {
+        self.wgs.dimension_type(name).to_owned()
+    }
+
+    /// Dimension type file (jar pack).
+    pub(crate) fn dim_type_json(&self, name: &str) -> Option<std::sync::Arc<serde_json::Value>> {
+        self.life.pack.get("dimension_type", self.wgs.dimension_type(name))
+    }
+
+    /// Field of a dimension type (jar pack).
+    pub(crate) fn dim_type_field(&self, name: &str, key: &str) -> Option<serde_json::Value> {
+        self.dim_type_json(name).and_then(|v| v.get(key).cloned())
+    }
+
+    /// Game attribute of a dimension (`attributes`), e.g. `minecraft:gameplay/respawn_anchor_works`.
+    pub(crate) fn dim_attribute(&self, name: &str, key: &str) -> Option<serde_json::Value> {
+        self.dim_type_json(name).and_then(|v| v.get("attributes")?.get(key).cloned())
+    }
+
+    /// `coordinate_scale` of the dimension type.
+    pub(crate) fn coordinate_scale(&self, name: &str) -> f64 {
+        self.dim_type_field(name, "coordinate_scale").and_then(|v| v.as_f64()).unwrap_or(match name {
+            NETHER => 8.0,
+            _ => 1.0,
+        })
+    }
+
+    /// Highest Y to place a portal: `min(max_y, min_y + logical_height - 1)`.
+    pub(crate) fn max_placeable_y(&self) -> i32 {
+        let h = self.dim.height;
+        let max_y = h.min_y + h.sections as i32 * 16 - 1;
+        let logical = self
+            .dim_type_field(&self.dim.name, "logical_height")
+            .and_then(|v| v.as_i64())
+            .map_or(h.sections as i32 * 16, |v| v as i32);
+        max_y.min(h.min_y + logical - 1)
+    }
+
+    fn new_world(&self, name: &str) -> World {
+        let dim = Dimension::new(&self.world, name, crate::dimension_height(&self.data, name));
+        let forced = crate::commands::cmds_world::read_forced(&dim.dir);
+        World {
+            forced,
+            forced_dirty: false,
+            sleep: (0, 0),
+            generator: crate::generation::start_for(&self.data, &self.world, name, &self.regs),
+            chunks: HashMap::new(),
+            entities: HashMap::new(),
+            kept_index: Default::default(),
+            too_old_entity_chunks: Default::default(),
+            bs: crate::blocks::level::Sim::new(&self.data),
+            mobs: Box::default(),
+            deco: Box::default(),
+            drops: Vec::new(),
+            drop_chunks: BTreeSet::new(),
+            orbs: Vec::new(),
+            furnaces: HashMap::new(),
+            brewers: HashMap::new(),
+            changed: Vec::new(),
+            pending_light_updates: Vec::new(),
+            relight: Vec::new(),
+            relight_sky: Vec::new(),
+            portal_tickets: PortalTickets::default(),
+            dim,
+            proj: Box::default(),
+            carts: Box::default(),
+            fangs: Vec::new(),
+            sign_editors: HashMap::new(),
+            left: Vec::new(),
+            swept: 0,
+        }
+    }
+
+    /// Makes dimension `name` active (parked, otherwise opened); the current one is parked.
+    pub(crate) fn enter_world(&mut self, name: &str) {
+        if self.dim.name == name {
+            return;
+        }
+        let mut w = match self.dims.parked.iter().position(|w| w.dim.name == name) {
+            Some(i) => self.dims.parked.swap_remove(i),
+            None => self.new_world(name),
+        };
+        self.exchange(&mut w);
+        self.dims.parked.push(w);
+    }
+
+    /// Runs `f` in dimension `name`, then returns to the world the server worked in. What happens
+    /// there reaches only the players standing there ([`Server::belongs_to_world`]): in a world
+    /// nobody stands in the server is muted, the rest still leaves. A visit to a world where a
+    /// player stands (a LAN guest's, or a nested `execute in overworld` coming back to the host's)
+    /// sends open, like a command run there.
+    pub(crate) fn in_world<R>(&mut self, name: &str, f: impl FnOnce(&mut Server) -> R) -> R {
+        let home = self.dim.name.clone();
+        if home == name {
+            return f(self);
+        }
+        let muted = self.muted;
+        // Muted during both exchanges: they must not take the players out of their world's boss
+        // bars (`end_on_park`, `raids_on_park`).
+        self.muted = true;
+        self.enter_world(name);
+        self.muted = !self.someone_stands_in(name);
+        let r = f(self);
+        self.muted = true;
+        self.enter_world(&home);
+        self.muted = muted;
+        r
+    }
+
+    /// Runs `f` in the world the current player stands in, sends open. A command run in another
+    /// dimension (`execute in`) still acts on a player in the player's own world, like the
+    /// game: the item `give` drops at the player's feet and its sound. A LAN guest's packets and
+    /// tick run there too (`as_guest`).
+    pub(crate) fn in_players_world<R>(&mut self, f: impl FnOnce(&mut Server) -> R) -> R {
+        match self.players_world_while_away().map(str::to_owned) {
+            Some(players_world) => self.in_world(&players_world, f),
+            None => f(self),
+        }
+    }
+
+    /// Damage dealt to the player by a command run in another world (`execute in`, a command
+    /// block or function ticking in a parked world). The game hands the command's world to the
+    /// hit, and that world only decides where the hurt packet and the shield's sound go (nowhere:
+    /// it tracks no player) and where an infestation's silverfish appear; the rest of the hit
+    /// (sounds, death drops, place of death) happens in the player's own world.
+    pub(crate) fn hurt_player_from_command<R>(&mut self, f: impl FnOnce(&mut Server) -> R) -> R {
+        let Some(players_world) = self.players_world_while_away().map(str::to_owned) else { return f(self) };
+        let command_world = Some(self.dim.name.clone());
+        self.in_world(&players_world, |sv| {
+            let outer = std::mem::replace(&mut sv.dims.hit_from_world, command_world);
+            let r = f(sv);
+            sv.dims.hit_from_world = outer;
+            r
+        })
+    }
+
+    /// The world the current player stands in (its client shows it) while the server works in
+    /// another one; `None` when it already works there.
+    pub(crate) fn players_world_while_away(&self) -> Option<&str> {
+        (self.client_world != self.dim.name).then_some(self.client_world.as_str())
+    }
+
+    /// Whether `e` describes the active world itself: its blocks, light and chunks, the
+    /// entities living there (not the players), the sounds, particles, explosions and boss
+    /// bars heard there, its border. The game sends such an event only to the players
+    /// standing in that world. Everything else is addressed to players or to the whole server
+    /// (chat, titles, difficulty, inventory, clocks, scores, the players' own entities…) and
+    /// leaves whatever dimension a command runs in.
+    pub(crate) fn belongs_to_world(&self, e: &Event) -> bool {
+        match e {
+            Event::LightUpdate { .. }
+            | Event::BlocksAheadOfLight { .. }
+            | Event::Chunk(_)
+            | Event::ForgetChunk { .. }
+            | Event::ChunkBiomes(_)
+            | Event::BlockUpdate { .. }
+            | Event::SectionUpdate { .. }
+            | Event::BlockDestruction { .. }
+            | Event::BlockEvent { .. }
+            | Event::BlockEntityData { .. }
+            | Event::Sound(_)
+            | Event::Particles(_)
+            | Event::LevelEvent { .. }
+            | Event::Explode(_)
+            | Event::Border(_)
+            | Event::Boss(_)
+            | Event::Waypoint(_) => true,
+            Event::Entity(ee) => !entity_event_subject(ee).is_some_and(|id| self.is_player_entity(id)),
+            Event::Attributes { entity, .. } => !self.is_player_entity(*entity),
+            Event::Misc(m) => !matches!(
+                m,
+                rc_client::misc::Misc::PostEffects(_)
+                    | rc_client::misc::Misc::LowDiskSpace
+                    | rc_client::misc::Misc::ServerData { .. }
+            ),
+            Event::Bundle(list) => list.iter().any(|e| self.belongs_to_world(e)),
+            _ => false,
+        }
+    }
+
+    /// Entity id of a player in game (the host or a LAN guest).
+    fn is_player_entity(&self, id: i32) -> bool {
+        id == self.player_id || self.lan_others().any(|c| c.player_id == id)
+    }
+
+    /// Reading of the player file's "portals" fields (once).
+    pub(crate) fn dims_read_player(&mut self) {
+        if self.dims.read {
+            return;
+        }
+        self.dims.read = true;
+        let root = &self.pdata.root;
+        self.dims.player.cooldown = nbtio::int(root, "PortalCooldown").unwrap_or(0) as i32;
+        self.dims.seen_credits = nbtio::int(root, "seenCredits").is_some_and(|v| v != 0);
+        self.dims.entered_nether = nbtio::f64s::<3>(root.get("entered_nether_pos"));
+    }
+
+    /// Portal return delay of the simulated entity `id`, as written in its NBT.
+    pub(crate) fn portal_cooldown(&self, id: i32) -> i32 {
+        self.dims.ents.get(&id).map_or(0, |p| p.cooldown)
+    }
+
+    /// `PortalCooldown` of an entity read from its NBT (chunk or summon): a running delay is
+    /// restored under its new identifier, the game reads it for every entity.
+    pub(crate) fn load_portal_cooldown(&mut self, id: i32, e: &Nbt) {
+        if let Some(cd) = nbtio::int(e, "PortalCooldown").filter(|&v| v > 0) {
+            self.dims.ents.insert(id, EntPortal { cooldown: cd as i32, proc: None });
+        }
+    }
+
+    /// "Portals" fields written in the player file.
+    pub(crate) fn dims_player_nbt(&self, root: &mut Nbt) {
+        nbtio::set(root, "PortalCooldown", Nbt::Int(self.dims.player.cooldown));
+        nbtio::set(root, "seenCredits", Nbt::Byte(i8::from(self.dims.seen_credits)));
+        match self.dims.entered_nether {
+            Some(p) => nbtio::set(root, "entered_nether_pos", Nbt::List(p.iter().map(|&d| Nbt::Double(d)).collect())),
+            None => nbtio::remove(root, "entered_nether_pos"),
+        }
+    }
+
+    /// Save of the parked dimensions: modified chunks, furnaces, items.
+    pub(crate) fn save_parked(&mut self, jobs: &mut Vec<crate::save::Job>, wait: bool) -> usize {
+        let names: Vec<String> = self.dims.parked.iter().map(|w| w.dim.name.clone()).collect();
+        let mut n = 0;
+        for name in names {
+            n += self.in_world(&name, |s| {
+                // Proto-chunks of the parked dimension's generator: written before `jobs`.
+                s.flush_gen(wait);
+                s.flush_furnaces();
+                s.flush_brewers(); // G3-F13: brewing stands kept with their dimension
+                s.drops_save_jobs(jobs);
+                s.poi_save_jobs(jobs); // F05: points of interest of the parked dimension
+                s.end_save_jobs(jobs); // F15: dragon fight
+                s.raids_save_jobs(jobs); // L10-ENT: raids of the parked dimension
+                s.forced_save_jobs(jobs); // its own forced chunks, in its own folder
+                // Random sequences: a single set for the server, saved with the survival data.
+                s.chunk_jobs(jobs)
+            });
+        }
+        n
+    }
+
+    /// Closing: generators of the parked dimensions stopped, outputs resumed.
+    pub(crate) fn stop_parked(&mut self) {
+        let names: Vec<String> = self.dims.parked.iter().map(|w| w.dim.name.clone()).collect();
+        for name in names {
+            self.in_world(&name, |s| s.stop_gen());
+        }
+    }
+
+    /// "Dimensions" tick (after the mobs): portals of the player and entities, parked worlds
+    /// (generator, portal ticket).
+    pub(crate) fn dims_tick(&mut self) {
+        self.dims_read_player();
+        let runs = self.cmd.ticking.runs(); // frozen (`tick freeze`): only the player ticks
+        if runs {
+            self.gateways_tick();
+            self.drops_portal_tick();
+            self.mobs_portal_tick();
+            self.carts_portal_tick(); // G5-F06
+        }
+        self.player_portal_tick();
+        // Like the game, which ticks every world: the worlds where a guest stands, chunks are
+        // force-loaded or a portal ticket holds tick in full; the others only under a pearl ticket.
+        let away = self.worlds_simulated_away_from_host();
+        for world in &away {
+            self.tick_world_away_from_host(world, runs);
+        }
+        self.parked_tick(runs, &away);
+        if runs {
+            self.parked_raids_tick(&away); // L10-ENT: every world ticks its own raids
+        }
+    }
+
+    /// Notes the world `game_tick` simulates this tick, where its world part starts.
+    pub(crate) fn note_world_ticked_by_game_tick(&mut self) {
+        // `clone_from` keeps the allocation: nothing allocated per tick.
+        self.dims.world_ticked_by_game_tick.clone_from(&self.dim.name);
+        self.dims.host_left_during_world_tick = false;
+    }
+
+    /// Start of the tick of the world the server works in. A player who changes world during it
+    /// (a command block's teleport) leaves at once, but that world finishes its tick without the
+    /// player, like the game ([`Server::finish_the_tick_of_the_world_left`]).
+    pub(crate) fn begin_world_tick(&mut self) {
+        self.dims.running_tick.running = true;
+        self.dims.running_tick.world.clone_from(&self.dim.name);
+        self.dims.running_tick.seat = self.installed_seat();
+    }
+
+    /// LAN seat of the installed player (`None`: the host).
+    pub(crate) fn installed_seat(&self) -> Option<usize> {
+        self.lan.as_ref().and_then(|l| l.active)
+    }
+
+    /// Called once the current player changed world: during the tick of the world it left, the
+    /// server goes back there with the player hidden (the tick's remaining phases, the rest of a
+    /// scheduled tick loop included, must run in that world); [`Server::end_world_tick`] takes it
+    /// to the world the player reached.
+    pub(crate) fn finish_the_tick_of_the_world_left(&mut self) {
+        let tick = &self.dims.running_tick;
+        let ticks_this_player = tick.seat == self.installed_seat();
+        if !tick.running || !ticks_this_player || tick.player_left.is_some() || tick.world == self.dim.name {
+            return;
+        }
+        let world_left = tick.world.clone();
+        // The player's real world and position, read while the server works elsewhere.
+        let home = self.dims.home.replace(self.dim.name.clone());
+        let home_pos = std::mem::replace(&mut self.dims.home_pos, self.pos);
+        let left = PlayerLeftDuringTick { hid_the_player: self.hide_player(), muted: self.muted, home, home_pos };
+        self.muted = true;
+        self.enter_world(&world_left);
+        self.muted = !self.someone_stands_in(&world_left);
+        self.dims.running_tick.player_left = Some(left);
+    }
+
+    /// End of the tick started by [`Server::begin_world_tick`]: a player who left that world
+    /// during it is shown again, and the server goes to the world it stands in (the one it
+    /// reached, or another one a later command of that tick sent it to).
+    pub(crate) fn end_world_tick(&mut self) {
+        self.dims.running_tick.running = false;
+        let Some(left) = self.dims.running_tick.player_left.take() else { return };
+        if self.dims.running_tick.seat.is_none() {
+            self.dims.host_left_during_world_tick = true;
+        }
+        if left.hid_the_player {
+            self.show_player();
+        }
+        self.dims.home = left.home;
+        self.dims.home_pos = left.home_pos;
+        self.muted = true;
+        let world = self.client_world.clone();
+        self.enter_world(&world);
+        self.muted = left.muted;
+    }
+
+    /// Whether the current player left the world whose tick runs (hidden from it until its end).
+    pub(crate) fn player_left_the_ticking_world(&self) -> bool {
+        self.dims.running_tick.player_left.is_some()
+    }
+
+    /// Whether world `name` was simulated by `game_tick` this tick.
+    pub(crate) fn ticked_by_game_tick(&self, name: &str) -> bool {
+        self.dims.world_ticked_by_game_tick == name
+    }
+
+    /// Whether the host reached its world during this tick, after `game_tick` started the tick of
+    /// the one it left (a portal after it, a command block's teleport during it: that world then
+    /// finished its tick without the host): the world reached has not ticked yet this tick.
+    pub(crate) fn host_reached_its_world_this_tick(&self) -> bool {
+        let ticked = &self.dims.world_ticked_by_game_tick;
+        !ticked.is_empty() && *ticked != self.dim.name
+    }
+
+    /// Worlds other than the one `game_tick` simulated, simulated in full this tick: those where a
+    /// joined guest stands (the first one seated is installed for their tick) and those with
+    /// force-loaded chunks, the world the host reached during the tick included (each world ticks
+    /// once, the one left and the one reached alike); the world a command sent the host to during
+    /// the tick of the world it left ticks in any case, with the host present, like the game where
+    /// that world ticks after with the player in it. Empty, hence without allocation, while every
+    /// player stands in the host's world and no parked world keeps forced chunks.
+    fn worlds_simulated_away_from_host(&self) -> Vec<WorldAway> {
+        let mut away = Vec::new();
+        if self.host_reached_its_world_this_tick() {
+            let arrived = self.dims.host_left_during_world_tick;
+            let ticketed = !self.cmd.forced.is_empty() || !self.portal_tickets.is_empty();
+            self.add_if_simulated_away(&self.dim.name, arrived, ticketed, &mut away);
+        }
+        for w in &self.dims.parked {
+            if !self.ticked_by_game_tick(&w.dim.name) {
+                let ticketed = !w.forced.is_empty() || !w.portal_tickets.is_empty();
+                self.add_if_simulated_away(&w.dim.name, false, ticketed, &mut away);
+            }
+        }
+        away
+    }
+
+    /// World `name` joins `away` if a guest stands there, the host arrived there by a command
+    /// during the tick of the world it left (`host_arrived`), or it keeps forced chunks or portal
+    /// tickets (`ticketed`).
+    fn add_if_simulated_away(&self, name: &str, host_arrived: bool, ticketed: bool, away: &mut Vec<WorldAway>) {
+        let ticker = match self.first_guest_standing_in(name) {
+            Some(seat) => WorldTicker::Guest(seat),
+            None if host_arrived => WorldTicker::HostArrived,
+            None if ticketed => WorldTicker::Nobody,
+            None => return,
+        };
+        away.push(WorldAway { name: name.to_owned(), ticker });
+    }
+
+    /// Full tick of a world away from the host's tick: with the guest that stands there installed
+    /// (its own phases tick in the world's entity walk, like the host's in its world, and its own
+    /// tick then skips them), with the host that arrived there, or nobody there (force-loaded
+    /// chunks): muted, the host absent.
+    fn tick_world_away_from_host(&mut self, world: &WorldAway, runs: bool) {
+        match world.ticker {
+            WorldTicker::Guest(seat) => {
+                self.note_world_part_ticked(seat);
+                self.as_guest(seat, |s| s.tick_world_parts(runs, WorldTicker::Guest(seat)));
+            }
+            WorldTicker::HostArrived => self.tick_world_parts(runs, WorldTicker::HostArrived),
+            WorldTicker::Nobody => {
+                self.dims.home = Some(self.dim.name.clone());
+                self.dims.home_pos = self.pos;
+                self.in_world(&world.name, |s| s.with_player_absent(|s| s.tick_world_parts(runs, WorldTicker::Nobody)));
+                self.dims.home = None;
+                // A command of that tick may have sent the host to another world.
+                self.return_to_players_world();
+            }
+        }
+    }
+
+    /// The server back in the current player's world, if it works elsewhere.
+    fn return_to_players_world(&mut self) {
+        if self.client_world != self.dim.name {
+            let muted = std::mem::replace(&mut self.muted, true);
+            let world = self.client_world.clone();
+            self.enter_world(&world);
+            self.muted = muted;
+        }
+    }
+
+    /// The world part of a server tick, for a world other than the one `game_tick` ran (it runs
+    /// the host's, with the server-wide parts: clocks, functions, every world's border): light of
+    /// the changes between ticks, night skip, blocks (raids, natural spawns and special spawners
+    /// only with a player there, like the game's spawning chunks), dragon fight, entities, block
+    /// entities, entities through portals, then the changed blocks sent with their light.
+    fn tick_world_parts(&mut self, runs: bool, ticker: WorldTicker) {
+        let with_player = ticker != WorldTicker::Nobody;
+        // The host's world moved its entities through portals at the head of `dims_tick`.
+        let portals_already_ticked = ticker == WorldTicker::HostArrived;
+        self.poll_gen();
+        let blocks_at_tick_end = Self::blocks_sent_at_tick_end();
+        if !blocks_at_tick_end {
+            self.relight_changed_blocks();
+        }
+        self.bs.handling_tick = true;
+        self.begin_world_tick();
+        // Each world decides its own night skip, among the players standing there (frozen too).
+        self.sleep_world_tick();
+        if runs {
+            self.tick_level_blocks(with_player);
+            if with_player && !self.player_left_the_ticking_world() {
+                self.end_fight_tick();
+            }
+        } else if !blocks_at_tick_end {
+            self.broadcast_changed_blocks();
+        }
+        self.bs.handling_tick = false;
+        self.tick_entities_with(with_player && !self.player_left_the_ticking_world());
+        if runs {
+            self.tick_block_entities();
+        }
+        if runs && !portals_already_ticked {
+            self.drops_portal_tick();
+            self.mobs_portal_tick();
+            self.carts_portal_tick();
+        }
+        // Every family walked: when the world goes back to a parked tick, what no longer ticks
+        // there leaves the list again (`walk_park_sweep`).
+        self.walk.swept = 0;
+        if blocks_at_tick_end {
+            self.flush_block_changes();
+        } else {
+            self.relight_changed_blocks();
+        }
+        // This world's frames, for the players standing in it (shown in their own tick).
+        self.frames_of_world_tick();
+        self.end_world_tick();
+    }
+
+    /// Runs `f` with the installed player absent from the world the server works in: moved out
+    /// of reach, not loaded, just joined (nothing of that world targets, loads around or reaches
+    /// it), restored afterwards.
+    fn with_player_absent(&mut self, f: impl FnOnce(&mut Server)) {
+        let hid_the_player = self.hide_player();
+        f(self);
+        if hid_the_player {
+            self.show_player();
+        }
+    }
+
+    /// The installed player moved out of reach, not loaded, just joined, its real state kept in
+    /// `dims.hidden_player`; false (nothing done) if it is hidden already.
+    fn hide_player(&mut self) -> bool {
+        if self.dims.hidden_player.is_some() {
+            return false;
+        }
+        let hidden = HiddenPlayer { pos: self.pos, loaded: self.loaded, joined_tick: self.joined_tick };
+        self.dims.hidden_player = Some(hidden);
+        self.pos = [f64::from(i32::MAX), -1.0e9, f64::from(i32::MAX)];
+        self.loaded = false;
+        self.joined_tick = self.tick + 1;
+        true
+    }
+
+    /// The hidden player's real state put back.
+    fn show_player(&mut self) {
+        if let Some(hidden) = self.dims.hidden_player.take() {
+            self.restore_player(hidden);
+        }
+    }
+
+    /// Whether the installed player is hidden from the tick of a world it does not stand in.
+    pub(crate) fn player_is_hidden(&self) -> bool {
+        self.dims.hidden_player.is_some()
+    }
+
+    /// Runs a command with the hidden player shown: for a command, a player hidden from the rest
+    /// of a world's tick is a player like any other, at its real place in its own world (like a
+    /// command run in another world than the player's). What the command did to it (a teleport,
+    /// another world) is what comes back at the end of that tick; it stays hidden until then.
+    pub(crate) fn with_hidden_player_shown<R>(&mut self, f: impl FnOnce(&mut Server) -> R) -> R {
+        let Some(hidden) = self.dims.hidden_player.take() else { return f(self) };
+        self.restore_player(hidden);
+        let r = f(self);
+        // Hidden again by a departure during the command (`finish_the_tick_of_the_world_left`).
+        if self.dims.hidden_player.is_some() {
+            return r;
+        }
+        if let Some(home) = &mut self.dims.home {
+            home.clone_from(&self.client_world);
+            self.dims.home_pos = self.pos;
+        }
+        // A command may have brought the player into the world the server works in.
+        self.muted = !self.someone_stands_in(&self.dim.name);
+        self.hide_player();
+        r
+    }
+
+    fn restore_player(&mut self, hidden: HiddenPlayer) {
+        self.pos = hidden.pos;
+        self.loaded = hidden.loaded;
+        self.joined_tick = hidden.joined_tick;
+    }
+
+    /// Parked dimensions not simulated in full (`away`): generation always collected; entities
+    /// and tickets only if the world ticks (`runs` false under `tick freeze`).
+    fn parked_tick(&mut self, runs: bool, away: &[WorldAway]) {
+        // L9-TICK: a pearl ticket (of the host or of a guest, still flying or expiring) keeps
+        // the world active like the game's.
+        // A world under a portal ticket ticks in full (`worlds_simulated_away_from_host`).
+        let names: Vec<(String, bool, u16)> =
+            self.dims.parked.iter().map(|w| (w.dim.name.clone(), !w.proj.tickets.is_empty(), w.swept)).collect();
+        let home = self.dim.name.clone();
+        for (name, pearl, swept) in names {
+            if away.iter().any(|w| w.name == name) {
+                continue;
+            }
+            let has_gen = self.dims.parked.iter().any(|w| w.dim.name == name && w.generator.is_some());
+            // L10-ORDER: the families its own walk does not visit leave the list where their
+            // chunk no longer ticks, once until that walk visits them again. The world the host
+            // left during this tick already ticked in full (`game_tick`).
+            let active = pearl && runs && !self.ticked_by_game_tick(&name);
+            let walked = if active { crate::walk::PARKED_WALK } else { 0 };
+            let sweep = crate::walk::SWEPT & !walked & !swept;
+            if !has_gen && !pearl && sweep == 0 {
+                continue;
+            }
+            self.dims.home = Some(home.clone());
+            self.dims.home_pos = self.pos;
+            self.in_world(&name, |s| {
+                s.poll_gen();
+                if !active && sweep == 0 {
+                    return;
+                }
+                s.with_player_absent(|s| {
+                    if active {
+                        // Tickets of the previous tick applied, then the chunk source's purge.
+                        s.proj.pearl_tickets_apply();
+                        s.proj.pearl_tickets_purge(s.time);
+                    }
+                    s.walk.swept = (s.walk.swept & !walked) | sweep;
+                    s.walk_park_sweep(sweep);
+                    if active {
+                        // A player's pearl keeps its own ticket while it flies (the game's pearl
+                        // ticket): only its projectiles tick then.
+                        s.tick_parked_entities();
+                        s.flush_block_changes();
+                    }
+                });
+            });
+            self.dims.home = None;
+        }
+        self.pearl_jumps();
+    }
+
+    /// Player pearls that fell into another dimension: if the player can
+    /// still go through a portal (alive, awake), they are taken there, their fall forgotten, then
+    /// hurt by 5 (pearl); return delay set if the pearl itself was on delay.
+    fn pearl_jumps(&mut self) {
+        for (dim, pos, cooling) in std::mem::take(&mut self.dims.pearl_jumps) {
+            if self.life.vit.dead || self.life.vit.sleeping.is_some() {
+                continue;
+            }
+            if cooling {
+                self.dims.player.cooldown = crate::portal::PLAYER_COOLDOWN;
+            }
+            let t = Transition {
+                dim,
+                pos,
+                yaw: 0.0,
+                pitch: 0.0,
+                relative: rel::ROTATION,
+                sound: false,
+                ticket: None,
+                missing_respawn: false,
+            };
+            self.teleport_player(t);
+            self.life.vit.fall = 0.0;
+            self.life.vit.impulse_reset();
+            self.mobs.player_vel = [0.0; 3];
+            // Player in the middle of a dimension change (not yet "loaded"): the game lets
+            // only the pearl's damage through.
+            let loaded = std::mem::replace(&mut self.loaded, true);
+            self.hurt("minecraft:ender_pearl", 5.0);
+            self.loaded = loaded;
+            self.play_sound("minecraft:entity.player.teleport", 7, pos, 1.0, 1.0);
+        }
+    }
+
+    /// The portal ticket of passage `t`, if it places one, in its arrival dimension.
+    pub(crate) fn place_transition_ticket(&mut self, t: &Transition) {
+        if let Some(at) = t.ticket_pos() {
+            self.place_portal_ticket(&t.dim, at);
+        }
+    }
+
+    /// Portal ticket (300 ticks) placed in dimension `name` at the chunk of `at`, where an entity
+    /// arrived through a portal; the chunks it keeps loaded are loaded now.
+    pub(crate) fn place_portal_ticket(&mut self, name: &str, at: [f64; 3]) {
+        let chunk = ((at[0].floor() as i32) >> 4, (at[2].floor() as i32) >> 4);
+        let r = PORTAL_TICKET_LOADED_RADIUS;
+        let around: Vec<(i32, i32)> =
+            (-r..=r).flat_map(|dx| (-r..=r).map(move |dz| (chunk.0 + dx, chunk.1 + dz))).collect();
+        self.in_world(name, |s| {
+            s.portal_tickets.place(chunk);
+            s.ensure_loaded(&around);
+        });
+    }
+
+    /// Height and flags of the active dimension type (`login`/`respawn` packets).
+    pub(crate) fn current_height(&self) -> rc_proto_v777::config::DimensionHeight {
+        let t = self.dimension_type_of(&self.dim.name);
+        rc_proto_v777::config::DimensionHeight {
+            min_y: self.dim.height.min_y,
+            height: self.dim.height.sections as i32 * 16,
+            nether_light: self.data.dimension_types.iter().any(|d| d.name == t && d.nether_light),
+        }
+    }
+
+    /// The world has just changed for the player (portal, respawn): client view
+    /// reset, chunks resent, items re-announced.
+    pub(crate) fn reset_view(&mut self) {
+        self.sent.clear();
+        self.queue.clear();
+        self.center = None;
+        self.loaded = false;
+        self.joined_tick = self.tick;
+        self.mining = None;
+    }
+
+    /// The current player moves to world `to` (dimension change, respawn elsewhere): the server
+    /// works there from now on and the player's client shows it. While other players stay in the
+    /// world left, it goes on for them: its boss bars stay theirs (the exchange is muted) and only
+    /// the leaving player's client drops them.
+    pub(crate) fn move_current_player_to_world(&mut self, to: &str) {
+        let from = self.dim.name.clone();
+        let others_stay = from != to && self.others_stand_in(&from);
+        if others_stay {
+            self.world_bars_removed_for_current_player();
+            let muted = std::mem::replace(&mut self.muted, true);
+            self.enter_world(to);
+            self.muted = muted;
+        } else {
+            self.enter_world(to);
+        }
+        self.player_enters_active_world();
+        self.forget_world_entities(&from, others_stay);
+        // One player more here and one less there: both worlds' sleepers lists refreshed, like
+        // the game's removal from a world and addition to another.
+        self.update_sleeping_list();
+        if others_stay {
+            self.in_world(&from, Server::update_sleeping_list);
+        }
+    }
+
+    /// The dragon fight's and the raids' bars of the world the server works in: the current
+    /// player alone leaves them.
+    fn world_bars_removed_for_current_player(&mut self) {
+        self.fight_bar_removed_for_current_player();
+        self.raid_bars_removed_for_current_player();
+    }
+
+    /// Entities of the world left (`name`) forgotten by the player's client (it clears its
+    /// entities at `respawn`), those of the arrival world announced again. While other players
+    /// stay in the world left (`others_stay`), its entities keep their tracking for them and only
+    /// the leaving player's client drops its wither bars.
+    pub(crate) fn forget_world_entities(&mut self, name: &str, others_stay: bool) {
+        // The mobs are tracked per player: the one moving (`None`: the host) is paired afresh
+        // in the world it reaches and is no longer paired in the world it left; the other
+        // players' pairings stay as they are.
+        let seat = self.installed_seat();
+        let mine = Some(self.uuid);
+        let mut bars = Vec::new();
+        let mut bars_of_the_leaving_player = Vec::new();
+        if let Some(w) = self.dims.parked.iter_mut().find(|w| w.dim.name == name) {
+            // L9-TICK: the bobber left behind no longer finds its player in its world: the game
+            // discards it at its next tick, before the rod can be used again. The other players'
+            // bobbers stay with the world.
+            w.proj.hooks.retain(|h| h.as_ref().is_some_and(|h| h.p.owner != mine));
+            if others_stay {
+                for m in w.mobs.list.iter_mut() {
+                    m.track.forget_player(seat);
+                }
+                let shown = w.mobs.list.iter().filter(|m| m.wither.bar_shown).map(|m| m.wither.bar);
+                bars_of_the_leaving_player.extend(shown);
+            } else {
+                forget_parked_world_tracking(w, &mut bars);
+            }
+        }
+        for m in self.mobs.list.iter_mut() {
+            m.track.forget_player(seat);
+            // F16: the arrival world's wither bars shown again to everyone standing there.
+            if std::mem::take(&mut m.wither.bar_shown) {
+                bars.push(m.wither.bar);
+            }
+        }
+        for b in bars {
+            crate::mobs::wither::boss::bar_removed(self, b);
+        }
+        for bar in bars_of_the_leaving_player {
+            let remove = rc_proto_v777::play::BossOp::Remove;
+            self.send_personal(Event::Boss(rc_proto_v777::play::BossEvent { id: bar, op: remove }));
+        }
+        self.proj_forget_tracking();
+        self.carts_forget_tracking(); // G5-F06
+    }
+
+    /// Player passage to `t` (same dimension: simple teleportation).
+    pub(crate) fn teleport_player(&mut self, t: Transition) {
+        self.player_remove_vehicle(); // no longer a passenger
+        if t.dim == self.dim.name {
+            self.send_relative_teleport(t.pos, t.yaw, t.pitch, t.relative);
+            if t.sound {
+                let _ = self.send(Event::LevelEvent { kind: 1032, pos: [0, 0, 0], data: 0, global: false });
+            }
+            return;
+        }
+        self.change_dimension(t);
+    }
+
+    /// Absolute position with relative flags (rotation added, velocity kept).
+    pub(crate) fn send_relative_teleport(&mut self, pos: [f64; 3], yaw: f32, pitch: f32, relative: i32) {
+        let ayaw = if relative & rel::Y_ROT != 0 { self.yaw + yaw } else { yaw };
+        let apitch = if relative & rel::X_ROT != 0 { self.pitch + pitch } else { pitch };
+        self.begin_teleport(pos);
+        self.yaw = ayaw;
+        self.pitch = apitch;
+        let _ = self.send(Event::Teleport(rc_proto_v777::play::PlayerPosition {
+            id: self.teleport_id,
+            pos,
+            delta: [0.0; 3],
+            yaw,
+            pitch,
+            relative,
+        }));
+    }
+
+    /// Player dimension change (other dimension): its client keeps all of its player's data.
+    pub(crate) fn change_dimension(&mut self, t: Transition) {
+        self.change_dimension_keeping(t, KEEP_ALL_DATA);
+    }
+
+    /// Player dimension change, its client keeping of its player what `keep` says
+    /// (`KEEP_ATTRIBUTE_MODIFIERS`, `KEEP_ALL_DATA`).
+    pub(crate) fn change_dimension_keeping(&mut self, t: Transition, keep: u8) {
+        let from = self.dim.name.clone();
+        // Before the worlds are swapped: the mount and the cushion stay in the old one.
+        self.player_remove_vehicle();
+        self.flush_block_changes();
+        if self.life.menu.is_some() {
+            self.close_menu(true);
+        }
+        let old_pos = self.pos;
+        self.inside_forget_player(); // G5-F02a: no sweep from one world to the other
+        self.move_current_player_to_world(&t.dim);
+        // The player joins the end of the arrival world's entity list.
+        self.walk.player = crate::walk::next_rank();
+        if t.missing_respawn {
+            let _ = self.send(Event::GameEvent { kind: 0, param: 0.0 });
+        }
+        let flat = self.is_flat();
+        let height = self.current_height();
+        let dimension = self.dimension_type_of(&self.dim.name);
+        let _ = self.send(Event::Respawn { height, dimension, flat, keep, last_death: self.life.vit.last_death.clone() });
+        let _ = self.send(Event::Difficulty { id: self.level.difficulty_id(), locked: self.level.difficulty_locked });
+        let _ = self.send(Event::Entity(EntityEvent::Event { id: self.player_id, event: crate::lan::op_event(self.cmd.op) }));
+        if from == OVERWORLD && t.dim == NETHER {
+            self.dims.entered_nether = Some(old_pos);
+        }
+        self.reset_view();
+        self.send_relative_teleport(t.pos, t.yaw, t.pitch, t.relative);
+        self.last_good = t.pos;
+        self.stop_using();
+        let _ = self.send(Event::Abilities(self.abilities()));
+        self.send_level_info();
+        self.life_send_inventory();
+        let _ = self.send(Event::HeldSlot(self.held));
+        if t.sound {
+            let _ = self.send(Event::LevelEvent { kind: 1032, pos: [0, 0, 0], data: 0, global: false });
+        }
+        self.life.vit.force_resend();
+        self.send_all_effects(); // S7
+        self.update_tracking();
+        // Client entities cleared by the respawn packet: items and orbs announced again.
+        self.reannounce_items_to_current_client();
+        self.reannounce_orbs();
+        self.s9_dimension(&from, &t.dim); // S9: `changed_dimension`, `nether_travel`
+        // Nether entry forgotten only after `nether_travel`, which reads it.
+        if t.dim != NETHER {
+            self.dims.entered_nether = None;
+        }
+        eprintln!("singleplayer: {} → {} at {:.1} {:.1} {:.1}", from, self.dim.name, t.pos[0], t.pos[1], t.pos[2]);
+        self.finish_the_tick_of_the_world_left();
+    }
+
+    /// Border, clocks, spawn point, rain, chunk wait.
+    pub(crate) fn send_level_info(&mut self) {
+        self.send_border();
+        self.send_time(true);
+        let _ = self
+            .send(Event::SpawnPosition { dimension: self.level.spawn_dimension.clone(), pos: self.level.effective_spawn_pos() });
+        if self.dim.name == OVERWORLD {
+            self.send_weather_state();
+        }
+        let _ = self.send(Event::GameEvent { kind: 13, param: 0.0 });
+        self.send_ticking_state(); // current rate (`tick`)
+        self.send_ticking_step();
+    }
+}
