@@ -1,0 +1,11 @@
+# Linker flags that make the executable reproducible: two builds of the same commit give the same
+# bytes. The paths of the build machine are hidden by a per-machine file, see
+# tools/release/hide_paths.py (an absolute path cannot be committed here).
+
+[target.x86_64-pc-windows-msvc]
+rustflags = [
+    # The linker writes the build time into the executable header and its debug directory;
+    # with /Brepro it writes a hash of the content instead. (The path of the .pdb is already cut
+    # down to its file name by rustc itself, `/PDBALTPATH:%_PDB%`.)
+    "-C", "link-arg=/Brepro",
+]
