@@ -1,0 +1,630 @@
+//! Singleplayer mobs (mission S4, `docs/specs/server-mobs.md`): twelve common species
+//! simulated on the integrated server side like the official 26.3 server — physics, goals and
+//! navigation, combat, spawning and despawning, network tracking, save in `entities/`.
+
+pub(crate) mod allies; // ally test (teams, owners, illager friends) and the can-attack test
+#[cfg(test)]
+mod targeting_rules_tests; // wolf prey, creeper and goat, allies, chases that let go
+#[cfg(test)]
+mod tamed_animal_rules_tests; // lead and sit order of pets, the wolf's anger and its save
+#[cfg(test)]
+mod creature_world_rules_tests; // fall reset ray, blown blocks' after-break, visual fire, milk, copper paths
+pub(crate) mod aquatic;
+pub(crate) mod arrows;
+pub(crate) mod bar_viewers; // players registered in a world's boss bar (dragon fight, raids)
+mod bell;
+pub(crate) mod blast_rays;
+mod body;
+pub(crate) mod bound_player; // local network: the player a mob deals with, installed for its tick
+pub(crate) use body::{PlayerPose, PoseRoom, guest_box, guest_dims};
+#[cfg(test)]
+pub(crate) use body::Headroom;
+#[cfg(test)]
+mod body_movement_tests; // one state read under the feet, support from the kept boxes, crowd fingerprint
+#[cfg(test)]
+mod push_scan_tests; // mobs pushed by a mob: scan orders and contact storages compared, crowd fingerprint
+pub(crate) mod move_stats; // rest rate of the movements (`RUSTCRAFT_PERFLOG`)
+mod resize; // refit after the box grows
+pub(crate) mod fireballs;
+pub(crate) mod gear; // G5-F04: attribute modifiers of the equipment
+pub(crate) mod equip_choice; // which item a mob would rather wear or hold, and equipping it
+#[cfg(test)]
+mod loot_pickup_tests; // common pickup of ground items, fox stack split, summoned lightning
+pub(crate) mod nether;
+pub(crate) mod brains;
+pub(crate) mod brainy;
+pub(crate) mod combat;
+pub(crate) mod cubes;
+pub(crate) mod effects;
+pub(crate) mod env;
+pub(crate) mod end;
+pub(crate) mod explode;
+pub(crate) mod visible_part; // visible part of an explosion's targets: cell cube, air shortcut, objects together
+pub(crate) mod goals;
+pub(crate) mod golems;
+pub(crate) mod ground_items; // dropped items seen by the mobs' pickups, the common pickup
+pub(crate) mod illagers;
+pub(crate) mod index;
+pub(crate) mod interact; // G5-F03: name tag, egg, dyeing, cat and wolf
+pub(crate) mod jrand;
+pub(crate) mod leash; // G4-F07a: lead, fence knot
+#[cfg(test)]
+mod tests_leash;
+pub(crate) mod list;
+#[cfg(test)]
+mod tests_list;
+pub(crate) mod mob;
+pub(crate) mod mounts;
+pub(crate) mod mth;
+pub(crate) mod nav;
+mod pests;
+pub(crate) mod persistent_anger; // anger kept by UUID: iron golem, wolf
+pub(crate) mod piglins; // F13: piglins and hoglins
+mod phantom;
+pub(crate) mod sealife;
+pub(crate) mod recent; // F14: warden, breeze, creaking, happy ghast
+pub(crate) mod spawn;
+pub(crate) mod species;
+pub(crate) mod stack_components; // per-species components a spawn egg hands to its mob
+pub(crate) mod structure_spawn; // F07: spawn lists of structures
+pub(crate) mod surface;
+mod tick;
+
+pub(crate) mod track;
+pub(crate) mod trades;
+/// Dye mixing, shared with the client's recipe book demonstration.
+pub use trades::apply_dyes;
+pub(crate) mod trial; // W9: cages, trial spawners, vaults
+pub(crate) mod variants;
+pub(crate) mod villager;
+pub(crate) mod wild;
+pub(crate) mod wither; // F16
+
+#[cfg(test)]
+mod animal_scan_tests;
+#[cfg(test)]
+mod goal_search_tests; // neighbour searches, melee reach, goal selector and block searches: old and new paths compared
+#[cfg(test)]
+mod enderman_stare_tests; // staring at an enderman makes it hostile
+#[cfg(test)]
+mod tag_tests;
+#[cfg(test)]
+mod tests;
+#[cfg(test)]
+mod tests_f01;
+#[cfg(test)]
+mod tests_steady_synced_data;
+#[cfg(test)]
+mod bench_mob_network_sync; // synced data refresh, attribute read, tracking pass by thread count
+#[cfg(test)]
+mod tracking_stream_tests; // every entity packet of a tracked crowd against a stored fingerprint
+#[cfg(test)]
+mod tests_index;
+#[cfg(test)]
+mod tests_index_world;
+#[cfg(test)]
+mod tests_g4f02;
+#[cfg(test)]
+mod tests_integ;
+#[cfg(test)]
+mod tests_loot_rng;
+#[cfg(test)]
+mod tests_patterns;
+#[cfg(test)]
+mod tests_respawn_blast;
+#[cfg(test)]
+mod tests_explosion_rays;
+#[cfg(test)]
+mod tests_visible_part;
+#[cfg(test)]
+mod tests_w10;
+#[cfg(test)]
+mod tests_g4f03;
+#[cfg(test)]
+mod tests_g5f03;
+#[cfg(test)]
+mod tests_g5f03b;
+#[cfg(test)]
+mod tests_g4f07b;
+#[cfg(test)]
+mod tests_g5f02b;
+#[cfg(test)]
+pub(crate) mod tests_spawn_paths; // spawner blocks and natural spawns: former and optimised paths compared
+#[cfg(test)]
+mod tests_spawn_rules; // natural spawns, spawn eggs and spawners against the rules of the game
+#[cfg(test)]
+mod spawn_data_tests; // frog variants by biome, the rivers' tag, enchanted spawn equipment
+#[cfg(test)]
+mod bucket_and_brush_tests; // mobs taken into a bucket (its trigger), an armadillo brushed
+#[cfg(test)]
+mod spawn_obstruction_tests; // each species' spawn obstruction test, live world and new chunks
+
+use rc_proto::Reader;
+use rc_proto::nbt::Nbt;
+use rc_proto::varint::read_varint;
+
+use mob::{Ent, Mob};
+use species::Kind;
+
+use crate::player::Stack;
+use crate::server::Server;
+
+/// State of the mobs of the open world.
+pub struct Mobs {
+    /// Mobs in order of addition (list of ticking entities), changed only through its small API.
+    pub list: list::MobList,
+    /// Hint id/UUID → slot of `list` (checked at every read, see `index`).
+    pub index: index::MobIndex,
+    /// World random for mobs (spawns, finalisations, sounds).
+    pub rng: jrand::JRand,
+    /// Player: last attacker (mob, timestamp), last mob hit.
+    pub player_hurt_by: Option<(Ent, i32)>,
+    /// Player: last player who hurt it (entity id, timestamp), credited with its death for 100
+    /// ticks; also its last attacker while no mob hit it since (`player_hurt_by` empty then).
+    pub player_hurt_by_player: Option<(i32, i32)>,
+    pub player_hit: Option<(Ent, i32)>,
+    pub player_ticks: i32,
+    /// Attack strength of the player.
+    pub attack_ticker: i32,
+    /// Who swings the arm after the right click on a mob being handled (set by the reactions
+    /// that differ from the usual case, read once the click succeeded).
+    pub(crate) interaction_swing: brains::InteractSwing,
+    pub last_main_hand: Option<(String, i32)>,
+    /// Speed of the player as seen by the server (knockback).
+    pub player_vel: [f64; 3],
+    /// Entity chunks whose mobs have already been read.
+    pub adopted: hashbrown::HashSet<(i32, i32)>,
+    /// Charged creeper exploding (identifier, head already dropped): only one victim
+    /// drops its head (table `charged_creeper/root`).
+    pub charged_skull: Option<(i32, bool)>,
+    /// F01: attacker whose hit is being applied (random lent for the reaction to a kill), species, identifier.
+    pub killer: Option<(jrand::JRand, Kind, i32, [i32; 3])>,
+    /// F01: phantom spawner (next attempt).
+    pub phantom_next: i32,
+    pub rest_dead: bool,
+    /// Mob whose hit is being applied to the player (death message).
+    pub hit_by: Option<Kind>,
+    /// Parrots on the player's shoulders (left, right) and time of the last placement (F02).
+    pub shoulder: [Option<Nbt>; 2],
+    pub shoulder_time: i64,
+    pub shoulder_loaded: bool,
+    /// F03: seed (slime chunks), known speed of the player, sulfur cube archetypes.
+    pub cubes: cubes::CubesWorld,
+    /// F04: mounted player, llama spits, trap lightning.
+    pub mounts: mounts::World,
+    /// Special generators of the cats and of the zombie siege (Overworld).
+    pub spawners: spawn::CustomSpawners,
+    /// F05: registry of points of interest, world state of villagers and traders.
+    pub poi: crate::poi::Pois,
+    pub npc: villager::NpcWorld,
+    /// F07: patrols, fangs, thrown potions, raids.
+    pub ill: illagers::IllWorld,
+    /// F08: deferred thorns.
+    pub aqua: aquatic::AquaWorld,
+    /// F09: player swimming (dolphins).
+    pub sea: sealife::World,
+    /// F10: current killer (components read by the loot).
+    pub brainy: brainy::World,
+    /// F11: ticking beehives, stingers stuck in the player.
+    pub wild: wild::hive::HiveWorld,
+    /// F12: blaze and ghast fireballs.
+    pub fireballs: fireballs::FireballsWorld,
+    /// Mobs being ticked (taken out of `list` for the duration of their tick, passengers
+    /// included): (UUID, identifier). A projectile shot during this tick thus finds its
+    /// shooter (spawn data, author).
+    pub ticking: Vec<(u128, i32)>,
+    /// Frozen copies of the attackers being ticked (out of `list`), placed for the duration of a
+    /// hit: the victim finds its aggressor by identifier (`mob_ref`; anger, gossip,
+    /// aimed knockback). Never modified: `mob_index` does not see them.
+    pub ghosts: Vec<Mob>,
+    /// F13: shared range of the brain sensors.
+    pub pig: piglins::PigWorld,
+    /// F14: creaking hearts, vibrations, shriekers, wind charges.
+    pub rec: recent::RecWorld,
+    /// F15: crystals, dragon breath, shulker bullets, dragon fight.
+    pub end: end::EndWorld,
+    /// F16: blue skull explosion, wither being ticked.
+    pub wither: wither::WitherWorld,
+    /// Bells rung (resonance and glowing of pillagers).
+    pub bells: Vec<bell::Bell>,
+    /// Imposed Halloween day (tests, bench: `Server::halloween_override`); `None`: system
+    /// local date, like the game.
+    pub halloween: Option<bool>,
+    /// Buffers of the crossed-block pass (player and mobs).
+    pub(crate) inside: crate::inside_blocks::Scratch,
+    /// Last natural spawn census (F3 "SC" line).
+    pub census: Option<spawn::Census>,
+    /// Buffer of the entities one mob pushes (`mob_push_entities`), kept between mobs for its
+    /// capacity; always empty outside that call.
+    pub(crate) push_contacts: Vec<body::PushContact>,
+    /// Kept answers of "does the player hold this food?" for the current tick (tempted animals).
+    pub(crate) held_food: std::cell::RefCell<goals::HeldFoodMemo>,
+}
+
+impl Default for Mobs {
+    fn default() -> Mobs {
+        Mobs {
+            list: list::MobList::default(),
+            index: index::MobIndex::default(),
+            rng: jrand::JRand::from_time(0x5345_4153),
+            player_hurt_by: None,
+            player_hurt_by_player: None,
+            player_hit: None,
+            player_ticks: 0,
+            attack_ticker: 0,
+            interaction_swing: brains::InteractSwing::Predicted,
+            last_main_hand: None,
+            player_vel: [0.0; 3],
+            adopted: hashbrown::HashSet::new(),
+            charged_skull: None,
+            killer: None,
+            phantom_next: 0,
+            rest_dead: false,
+            hit_by: None,
+            shoulder: [None, None],
+            shoulder_time: i64::MIN / 2,
+            shoulder_loaded: false,
+            cubes: cubes::CubesWorld::default(),
+            mounts: mounts::World::default(),
+            spawners: spawn::CustomSpawners::default(),
+            poi: crate::poi::Pois::default(),
+            npc: villager::NpcWorld::default(),
+            ill: illagers::IllWorld::default(),
+            aqua: aquatic::AquaWorld::default(),
+            sea: sealife::World::default(),
+            brainy: brainy::World::default(),
+            wild: wild::hive::HiveWorld::default(),
+            fireballs: fireballs::FireballsWorld::default(),
+            ticking: Vec::new(),
+            ghosts: Vec::new(),
+            pig: piglins::PigWorld::default(),
+            rec: recent::RecWorld::default(),
+            end: end::EndWorld::default(),
+            wither: wither::WitherWorld::default(),
+            bells: Vec::new(),
+            halloween: Server::halloween_override(),
+            inside: Default::default(),
+            census: None,
+            push_contacts: Vec::new(),
+            held_food: Default::default(),
+        }
+    }
+}
+
+// Adding, removing, compacting and sorting the slots, and the mutable per-species walk, are in
+// `list.rs` with the slots they change.
+impl Mobs {
+    /// Mob of the list with identifier `id`, mutable.
+    #[inline]
+    pub(crate) fn get_mut(&mut self, id: i32) -> Option<&mut Mob> {
+        let i = self.index_of(id)?;
+        self.list.get_mut(i)
+    }
+
+    /// First mob of the list with UUID `u` that satisfies `pred` (same result as
+    /// `list.iter().find(|o| o.uuid == u && pred(o))`).
+    pub(crate) fn find_uuid_where(&self, u: u128, pred: impl Fn(&Mob) -> bool) -> Option<&Mob> {
+        let i = self.index_of_uuid(u)?;
+        // No slot before `i` carries `u`: the scan resumes at `i`.
+        self.list.slots()[i..].iter().flatten().find(|o| o.uuid == u && pred(o)).map(|b| &**b)
+    }
+
+    /// First slot of the list carrying the identifier `id`.
+    #[inline]
+    pub(crate) fn index_of(&self, id: i32) -> Option<usize> {
+        self.index.find(self.list.slots(), id)
+    }
+
+    /// Mob of the list with identifier `id` (frozen copies excluded).
+    #[inline]
+    pub(crate) fn get(&self, id: i32) -> Option<&Mob> {
+        self.index_of(id).and_then(|i| self.list.get(i))
+    }
+
+    /// First slot of the list carrying the UUID `u`.
+    #[inline]
+    pub(crate) fn index_of_uuid(&self, u: u128) -> Option<usize> {
+        self.index.find_uuid(self.list.slots(), u)
+    }
+
+    /// Mob of the list with UUID `u`.
+    #[inline]
+    pub(crate) fn get_uuid(&self, u: u128) -> Option<&Mob> {
+        self.index_of_uuid(u).and_then(|i| self.list.get(i))
+    }
+
+    /// Mobs of species `k` in the list's order (empty slots skipped): same sequence as
+    /// `list.iter().filter(|o| o.kind == k)`, through the per-species index when it is reliable.
+    pub(crate) fn of_kind(&self, k: Kind) -> impl Iterator<Item = &Mob> {
+        self.of_kinds([k])
+    }
+
+    /// Mobs of any of the species `kinds` in the list's order: same sequence as
+    /// `list.iter().filter(|o| kinds.contains(&o.kind))`, through the per-species index
+    /// when it is reliable (the species' slots merged), by scanning the list otherwise.
+    pub(crate) fn of_kinds<const N: usize>(&self, kinds: [Kind; N]) -> impl Iterator<Item = &Mob> {
+        let list = self.list.slots();
+        let slots = self.index.kinds_slots(list, kinds);
+        #[cfg(test)]
+        if index::verify() {
+            check_species_slots(list, slots.clone(), kinds);
+        }
+        // Only one of the two sequences is non-empty: indexed slots, or the whole list.
+        let (slots, all) = match slots {
+            Some(s) => (s, &list[..0]),
+            None => (index::MergedSlots::empty(), list),
+        };
+        slots
+            .filter_map(|i| list[i].as_deref())
+            .chain(all.iter().flatten().map(|b| &**b))
+            .filter(move |o| kinds.contains(&o.kind))
+    }
+
+    /// `of_kind`, mutable (alerts of the same species, anger reset).
+    pub(crate) fn of_kind_mut(&mut self, k: Kind) -> impl Iterator<Item = &mut Mob> {
+        self.of_kinds_mut([k])
+    }
+}
+
+/// Tests: the indexed sequence of `of_kinds` equals the filtered scan (same mobs, same order).
+#[cfg(test)]
+fn check_species_slots<const N: usize>(
+    list: &[Option<Box<Mob>>],
+    slots: Option<index::MergedSlots<'_, N>>,
+    kinds: [Kind; N],
+) {
+    let Some(slots) = slots else { return };
+    let fast: Vec<i32> = slots.filter_map(|i| list[i].as_deref()).map(|o| o.id).collect();
+    let scan: Vec<i32> = list.iter().flatten().filter(|o| kinds.contains(&o.kind)).map(|o| o.id).collect();
+    assert_eq!(fast, scan, "per-species index: {kinds:?} wrong");
+}
+
+impl Server {
+    /// Mobs read with an entity chunk: those of the simulated species come alive.
+    pub(crate) fn adopt_mobs(&mut self, loaded: &[(i32, i32)]) {
+        for p in loaded {
+            if !self.mobs.adopted.insert(*p) {
+                continue;
+            }
+            let Some(list) = self.entities.get_mut(p) else { continue };
+            type Ents = Vec<(i32, Nbt)>;
+            let (mine, rest): (Ents, Ents) = std::mem::take(list)
+                .into_iter()
+                .partition(|(_, e)| e.get("id").and_then(Nbt::as_str).is_some_and(|n| Kind::from_name(n).is_some()));
+            *list = rest;
+            for (id, e) in mine {
+                // F04: passengers recorded in their vehicle (`Passengers`).
+                self.adopt_with_passengers(id, &e, None);
+            }
+        }
+        self.end_adopt(loaded); // F15: crystals, clouds, dragon balls, bullets
+    }
+
+    /// Mobs to write into the entity chunks (with the dropped items of S2).
+    pub(crate) fn mobs_into_chunks(&self, by_chunk: &mut std::collections::BTreeMap<(i32, i32), Vec<Nbt>>) {
+        for m in self.mobs.list.iter() {
+            // F04: a passenger is written in its vehicle.
+            if m.removed
+                || m.dead
+                || m.mount.vehicle.is_some_and(|v| self.mob_ref(v).is_some() || self.cart_ref(v).is_some())
+                || self.leaves_with_player(m)
+            {
+                continue;
+            }
+            let c = ((m.pos()[0].floor() as i32) >> 4, (m.pos()[2].floor() as i32) >> 4);
+            by_chunk.entry(c).or_default().push(self.save_with_passengers(m));
+        }
+        self.end_into_chunks(by_chunk); // F15
+    }
+
+    /// Mob read (and its simulated passengers, recursively); the others stay as NBT.
+    pub(crate) fn adopt_with_passengers(&mut self, id: i32, e: &Nbt, vehicle: Option<&mut Mob>) -> Option<i32> {
+        let kind = Kind::from_name(e.get("id").and_then(Nbt::as_str).unwrap_or(""))?;
+        let id = self.end_adopt_id(kind, id); // F15: dragon parts
+        let mut rng = jrand::JRand::from_time(i64::from(id));
+        // UUID drawn at construction (kept if the NBT has none, like the game): version 4.
+        let uuid = (rng.next_long() as u128) << 64 | rng.next_long() as u64 as u128;
+        let uuid = (uuid & !(0xF000u128 << 64) | (0x4000u128 << 64)) & !(0xC000_0000_0000_0000u128)
+            | 0x8000_0000_0000_0000u128;
+        let mut m = Mob::new(kind, id, uuid, [0.0; 3], 0.0, rng);
+        let mut e = e.clone();
+        let passengers = mounts::riding::take_passengers(&mut e);
+        m.load(&e);
+        self.enderman_load_carried(&mut m, &e);
+        // UUID already present (vehicle returned with the player): duplicate ignored.
+        if m.uuid != 0 && self.mobs.index_of_uuid(m.uuid).is_some() {
+            return None;
+        }
+        self.init_mob(&mut m);
+        self.load_portal_cooldown(m.id, &e);
+        // Illager placed by structure generation: finalised only once (the marker is never
+        // rewritten).
+        if e.get("rc_finalize_structure").is_some() {
+            let mut g = spawn::Group::default();
+            self.finalize_spawn(&mut m, spawn::Reason::Structure, &mut g);
+            // Marker removed from the kept compound (never rewritten on save).
+            if let Some(n) = &mut m.nbt {
+                crate::nbtio::remove(n, "rc_finalize_structure");
+            }
+        }
+        if kind.skeleton_like() {
+            brains::reassess_weapon(self, &mut m);
+        }
+        if let Some(v) = vehicle {
+            m.mount.vehicle = Some(v.id);
+            v.mount.passengers.push(mob::Passenger::Mob(m.id));
+            if kind.non_controlling_rider() {
+                v.mount.passive_riders.push(m.id);
+            }
+        }
+        for p in passengers {
+            if p.get("id").and_then(Nbt::as_str).and_then(Kind::from_name).is_some() {
+                self.next_entity += 1;
+                let pid = self.next_entity;
+                self.adopt_with_passengers(pid, &p, Some(&mut m));
+            } else {
+                m.mount.foreign_passengers.push(p);
+            }
+        }
+        let mid = m.id;
+        self.mobs.push(Box::new(m));
+        Some(mid)
+    }
+
+    /// NBT of a mob with its passengers (`Passengers`).
+    pub(crate) fn save_with_passengers(&self, m: &Mob) -> Nbt {
+        let mut e = self.mob_nbt(m);
+        self.enderman_save_carried(m, &mut e);
+        let mut list: Vec<Nbt> = Vec::new();
+        for p in &m.mount.passengers {
+            if let mob::Passenger::Mob(pid) = p
+                && let Some(o) = self.mob_ref(*pid)
+                && !o.removed
+                && !o.dead
+            {
+                list.push(self.save_with_passengers(o));
+            }
+        }
+        list.extend(m.mount.foreign_passengers.iter().cloned());
+        if list.is_empty() {
+            crate::nbtio::remove(&mut e, "Passengers");
+        } else {
+            crate::nbtio::set(&mut e, "Passengers", Nbt::List(list));
+        }
+        e
+    }
+
+    /// Packets specific to mobs (attack, interaction, void hit, eggs); true if handled.
+    pub(crate) fn mobs_packet(&mut self, p: &[u8]) -> bool {
+        // F04: packets of the mounted player (vehicle, keys, rotation only).
+        if self.mount_packet(p) {
+            return true;
+        }
+        let ids = self.peer.ids();
+        let mut r = Reader::new(p);
+        let Ok(id) = read_varint(&mut r) else { return false };
+        let r = &mut r;
+        if id == ids.attack {
+            let Ok(e) = read_varint(r) else { return true };
+            // F12: hit on a fireball (deflecting the ghast's big fireball).
+            // F15: dragon part, crystal, shulker bullet.
+            // G5-F06: minecart. Paintings, frames, armor stands, cushions.
+            // A piercing weapon stabs instead (`player_action` 8), and an item short of its
+            // minimum attack charge does not attack: the packet is then ignored.
+            if self.player_ready()
+                && !self.melee_attack_refused()
+                && !self.fireball_attacked(e)
+                && !self.end_attacked(e)
+                && !self.cart_attacked(e)
+                && !self.deco_attacked(e)
+                && !self.interaction_attacked(e)
+            {
+                self.player_attack(e);
+            }
+            true
+        } else if id == ids.interact {
+            let (Ok(e), Ok(hand)) = (read_varint(r), read_varint(r)) else { return true };
+            // Point touched (relative to the entity) and sneaking.
+            let at = rc_proto_v777::entity::read_lp_vec3(r).unwrap_or_default();
+            let secondary = { use rc_proto::Decode; bool::decode(r).unwrap_or(false) };
+            // G5-F06: minecart; decorations. G5-F05: interaction entity.
+            if self.player_ready()
+                && !self.cart_interact(e, hand)
+                && !self.deco_interact(e, hand, at, secondary)
+                && !self.interaction_used(e, hand)
+            {
+                self.player_interact(e, hand);
+            }
+            true
+        } else if id == ids.select_trade {
+            // F05: choice of an offer in the trade screen.
+            let Ok(i) = read_varint(r) else { return true };
+            self.merchant_select(i);
+            true
+        } else if id == ids.punch {
+            self.mobs.attack_ticker = 0;
+            true
+        } else if id == ids.use_item_on {
+            self.egg_use_item_on(r)
+        } else {
+            false
+        }
+    }
+
+    /// Spawn egg of a simulated species placed on a block; otherwise left to normal handling.
+    fn egg_use_item_on(&mut self, r: &mut Reader<'_>) -> bool {
+        use rc_proto::{BlockPos, Decode};
+        // Demo over: the common handling refuses the use.
+        if self.demo_world && self.demo.ended {
+            return false;
+        }
+        let Ok(hand) = read_varint(r) else { return false };
+        let Ok(bp) = BlockPos::decode(r) else { return false };
+        let Ok(face) = read_varint(r) else { return false };
+        let _ = (f32::decode(r), f32::decode(r), f32::decode(r), bool::decode(r), bool::decode(r));
+        let Ok(seq) = read_varint(r) else { return false };
+        let slot = if hand == 0 { 36 + self.held as usize } else { 45 };
+        let Some(item) = self.slots[slot].as_ref().map(|s| s.id.clone()) else { return false };
+        // F03: sulfur cube bucket emptied on the targeted face.
+        if item == "minecraft:sulfur_cube_bucket" && self.game_mode != 3 && self.player_ready() {
+            self.acknowledge(seq);
+            if self.sulfur_bucket_use(slot, [bp.x, bp.y, bp.z], face) {
+                self.broadcast_menus();
+            }
+            return true;
+        }
+        // F11: harvesting a full beehive (shears, bottle); sneaking with an item in hand,
+        // the block is not used.
+        if self.game_mode != 3
+            && !self.sneaking
+            && self.player_ready()
+            && self.hive_use_item_on(slot, [bp.x, bp.y, bp.z], &item)
+        {
+            self.acknowledge(seq);
+            return true;
+        }
+        // Adventure: crystal and egg only act on a block accepted by `can_place_on`.
+        let adventure_refused = self.game_mode == 2 && {
+            let held = self.slots[slot].clone();
+            !self.adventure_can_place_on(held.as_ref(), [bp.x, bp.y, bp.z])
+        };
+        if adventure_refused && (item == "minecraft:end_crystal" || item.ends_with("_spawn_egg")) {
+            self.acknowledge(seq);
+            return true;
+        }
+        // F15: End crystal placed on obsidian or bedrock.
+        if self.game_mode != 3 && self.player_ready() && item == "minecraft:end_crystal" {
+            self.acknowledge(seq);
+            self.end_use_item_on(slot, &item, [bp.x, bp.y, bp.z]);
+            return true;
+        }
+        if !item.ends_with("_spawn_egg") {
+            return false;
+        }
+        let Some(egg) = self.slots[slot].clone() else { return false };
+        if self.egg_entity_type(&egg).is_none() || self.game_mode == 3 || !self.player_ready() {
+            return false;
+        }
+        self.acknowledge(seq);
+        let pos = [bp.x, bp.y, bp.z];
+        if self.use_spawn_egg(&egg, pos, face) && self.game_mode != 1 {
+            if let Some(s) = &mut self.slots[slot] {
+                s.count -= 1;
+                if s.count <= 0 {
+                    self.slots[slot] = None;
+                }
+            }
+            self.broadcast_menus();
+        }
+        true
+    }
+
+    /// Resets the attack strength when the item in hand changes.
+    pub(crate) fn watch_main_hand(&mut self) {
+        let now = self.slots[36 + self.held as usize].as_ref().map(|s: &Stack| (s.id.clone(), s.count));
+        if now != self.mobs.last_main_hand {
+            self.mobs.last_main_hand = now;
+            self.mobs.attack_ticker = 0;
+        }
+    }
+}
