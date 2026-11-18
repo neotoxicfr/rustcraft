@@ -1,0 +1,1449 @@
+//! The world as seen by behaviours: reading states and fluids, placement with flags
+//! (§ 1.8, course of a placement), single scheduler of notifications (neighbour changed, series
+//! of 6, shape updates), destruction, dispatch to block families.
+
+use hashbrown::{HashMap, HashSet};
+use std::collections::VecDeque;
+use std::sync::Arc;
+
+use rc_client::Event;
+use rc_data::{PropKey, VersionData, flags};
+use rc_world::block_index;
+
+use super::attach::Sup;
+use super::orientation::{Orientation, SideBias};
+use super::table::View;
+use super::ticks::TickQueue;
+use super::{Dir, JavaRandom, Kind, P, Table, below, flag, rel};
+use crate::blocks::rules::*;
+use crate::server::Server;
+
+/// Scheduler job (§ 1.8). `orientation`: what the update carries under the redstone
+/// experiments (`orientation.rs`), `None` otherwise.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum Job {
+    Shape { dir: Dir, nstate: u32, pos: P, npos: P, flags: u32, limit: i32 },
+    Simple { pos: P, block: u16, orientation: Option<Orientation> },
+    Full { state: u32, pos: P, block: u16, moved: bool, orientation: Option<Orientation> },
+    Multi { src: P, block: u16, skip: Option<Dir>, idx: u8, orientation: Option<Orientation> },
+}
+
+/// Pending block event (§ 1.6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct BlockEvent {
+    pub pos: P,
+    pub block: u16,
+    pub a: i32,
+    pub b: i32,
+}
+
+/// Moving block of a piston (block entity, § 3.9).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Mover {
+    pub id: u64,
+    pub moved: u32,
+    pub dir: Dir,
+    pub extending: bool,
+    pub source: bool,
+    pub progress: f32,
+    pub progress_o: f32,
+    pub last_ticked: i64,
+}
+
+impl Mover {
+    /// Seen by physics (shape, push).
+    pub fn physics(&self) -> rc_physics::piston::Moving {
+        rc_physics::piston::Moving {
+            moved: self.moved,
+            dir: self.dir as u8,
+            extending: self.extending,
+            source: self.source,
+            progress: self.progress,
+        }
+    }
+
+    /// Direction the moved block travels: the piston's facing when extending, back otherwise.
+    pub fn push_direction(&self) -> Dir {
+        if self.extending { self.dir } else { self.dir.opposite() }
+    }
+}
+
+/// Simulation state of the blocks of a world.
+pub(crate) struct Sim {
+    pub t: Arc<Table>,
+    pub block_ticks: TickQueue,
+    pub fluid_ticks: TickQueue,
+    pub sub_tick: i64,
+    pub events: VecDeque<BlockEvent>,
+    pub event_set: HashSet<BlockEvent>,
+    stack: Vec<Job>,
+    added: Vec<Job>,
+    count: i64,
+    /// Rule `max-chained-neighbor-updates` (negative: unlimited).
+    pub max_chained: i64,
+    pub rng: JavaRandom,
+    /// Generator of random tick positions (§ 1.5).
+    pub lcg: i32,
+    /// Recent torch toggles (§ 3.6), single list for the world.
+    pub torches: VecDeque<(P, i64)>,
+    /// False during a computation of dust power (§ 3.3).
+    pub wire_signal: bool,
+    /// Buffers of the dust's second power evaluator (redstone experiments), reused.
+    pub(crate) oriented_wire: super::oriented_wire::OrientedWireWork,
+    /// Phase of the current world ticks (pistons, § 3.9).
+    pub handling_tick: bool,
+    pub movers: HashMap<P, Mover>,
+    /// Block entities that tick, in order of addition (§ 1.7).
+    pub tickers: Vec<super::ticks::Ticker>,
+    pub pending_tickers: Vec<super::ticks::Ticker>,
+    /// (Identifier, position) of every ticker in `tickers` or `pending_tickers`, kept on the
+    /// compacting path (`RUSTCRAFT_OPT_TICKER_COMPACTION`): a registration asks it instead of
+    /// scanning both lists.
+    pub registered_tickers: HashSet<(u64, P)>,
+    pub ticking_bes: bool,
+    pub next_be: u64,
+    /// Chunks whose saved ticks have been resumed.
+    pub imported: HashSet<(i32, i32)>,
+    pub entities: super::entities::Entities,
+    /// Random-tick sections (chunk, section index): cache recomputed as needed.
+    pub random_ticking_sections: HashMap<(i32, i32, usize), bool>,
+    /// Hoppers: ticker identifier, transfer delay, last tick.
+    pub hoppers: HashMap<P, (u64, i32, i64)>,
+    /// Direction of the current piston push: moving blocks in that direction do not block
+    /// the pushed entity (collision-free mechanism of the game).
+    pub noclip: Option<u8>,
+    /// Animated Shulker boxes: ticker identifier, state (0 closed, 1 opening,
+    /// 2 open, 3 closing), lid progress.
+    pub shulkers: HashMap<P, (u64, u8, f32)>,
+    /// G6-F01: jukeboxes and campfires that tick: ticker identifier and kept state.
+    pub be_ticks: HashMap<P, (u64, BeTick)>,
+    /// G5-F10: brushings in progress of suspicious blocks (not saved, as in the game).
+    pub brushing: HashMap<P, crate::brush::Brushing>,
+    /// L9-TICK: packed block entities of the loaded chunks (positions, in promotion order),
+    /// waiting for their chunk's neighbours to be loaded.
+    pub packed: HashMap<(i32, i32), Vec<P>>,
+}
+
+/// Kept state of a ticking block entity (G6-F01).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BeTick {
+    /// Jukebox with a disc: track in progress.
+    Jukebox(Option<super::jukebox::Song>),
+    /// Campfire: food present (cooking lit), cooking started (cooling
+    /// off); with neither, the tick is skipped.
+    Campfire { food: bool, warm: bool },
+    /// G5-F10: End gateway (age held in the NBT `Age`).
+    Gateway,
+    /// G5-F11: beacon (column being examined, levels).
+    Beacon(crate::beacon::BeaconTick),
+    /// G6-F12: conduit (active, tick of the next short ambient sound).
+    Conduit(super::conduit::ConduitTick),
+    /// G6-F09a: active sulfur outside the dry state (countdown in the `countdown` NBT field).
+    PotentSulfur,
+    /// G3-F13: furnace, blast furnace or smoker (state in `life.furnaces`).
+    Furnace,
+    /// G3-F13: brewing stand (state in `life.brewers`).
+    Brewing,
+    /// G3-F13: bell (state of a rung bell in `mobs.bells`, none before the first ring).
+    Bell,
+    /// G3-F13: monster spawner, trial spawner or vault (state in the block entity).
+    Spawner,
+    /// Crafter showing its `crafting` face (countdown in the `crafting_ticks_remaining` NBT
+    /// field); registered only while it counts down.
+    Crafter,
+    /// Sculk catalyst (its charges in the block entity's `cursors`).
+    Catalyst,
+}
+
+impl Sim {
+    pub fn new(data: &Arc<VersionData>) -> Sim {
+        // In test, seed follows the thread (like the other "clock" random draws, `rng::test_seed`).
+        #[cfg(test)]
+        let seed = crate::rng::test_seed();
+        #[cfg(not(test))]
+        let seed = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as i64)
+            .unwrap_or(0);
+        let mut rng = JavaRandom::new(seed);
+        let lcg = rng.next_int();
+        Sim {
+            t: Table::shared(data),
+            block_ticks: TickQueue::default(),
+            fluid_ticks: TickQueue::default(),
+            sub_tick: 0,
+            events: VecDeque::new(),
+            event_set: HashSet::new(),
+            stack: Vec::new(),
+            added: Vec::new(),
+            count: 0,
+            max_chained: 1_000_000,
+            rng,
+            lcg,
+            torches: VecDeque::new(),
+            wire_signal: true,
+            oriented_wire: Default::default(),
+            handling_tick: false,
+            movers: HashMap::new(),
+            tickers: Vec::new(),
+            pending_tickers: Vec::new(),
+            registered_tickers: HashSet::new(),
+            ticking_bes: false,
+            next_be: 1,
+            imported: HashSet::new(),
+            entities: Default::default(),
+            random_ticking_sections: HashMap::new(),
+            hoppers: HashMap::new(),
+            noclip: None,
+            shulkers: HashMap::new(),
+            be_ticks: HashMap::new(),
+            brushing: HashMap::new(),
+            packed: HashMap::new(),
+        }
+    }
+}
+
+/// Fluid state of a block state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Fluid {
+    /// 0 empty, 1 water, 2 lava.
+    pub kind: u8,
+    pub source: bool,
+    pub amount: u8,
+    pub falling: bool,
+}
+
+impl Fluid {
+    pub const EMPTY: Fluid = Fluid { kind: 0, source: false, amount: 0, falling: false };
+
+    pub fn is_empty(self) -> bool {
+        self.kind == 0
+    }
+
+    /// Exact type of the game (source and flowing are two types): 0 empty, 1 water, 2 flowing
+    /// water, 3 lava, 4 flowing lava.
+    pub fn type_id(self) -> u8 {
+        match (self.kind, self.source) {
+            (0, _) => 0,
+            (k, true) => k * 2 - 1,
+            (k, false) => k * 2,
+        }
+    }
+
+    pub fn own_height(self) -> f32 {
+        f32::from(self.amount) / 9.0
+    }
+}
+
+/// Fluid state of block state `s`. Called several times per block in fluid ticks: no name
+/// comparison, the type comes from the table.
+#[inline]
+pub(crate) fn fluid_of_state(table: &Table, data: &VersionData, s: u32) -> Fluid {
+    let info = data.states.get(s as usize).copied().unwrap_or_default();
+    let kind = table.fluid_kind.get(info.fluid as usize).copied().unwrap_or(0);
+    if kind == 0 {
+        return Fluid::EMPTY;
+    }
+    Fluid { kind, source: info.has(flags::FLUID_SOURCE), amount: info.fluid_amount, falling: info.has(flags::FLUID_FALLING) }
+}
+
+/// Palette prefilter of [`Server::scan_box`] (`RUSTCRAFT_OPT_SCAN_PALETTE=0` reads every cell).
+fn scan_palette() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| rc_data::env_str!("RUSTCRAFT_OPT_SCAN_PALETTE") != Some("0"))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Block views made on this thread: `bench_ticks` prints them per tick, what the former
+    /// counted view cost is multiplied by.
+    pub(crate) static VIEWS_MADE: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+impl Server {
+    /// Block view of the server: two borrowed references, free to make (no reference counting).
+    /// A view held across a `&mut self` call is made again after it.
+    #[inline]
+    pub(crate) fn view(&self) -> View<'_> {
+        #[cfg(test)]
+        VIEWS_MADE.with(|n| n.set(n.get() + 1));
+        View { table: &self.bs.t, data: &self.data }
+    }
+
+    #[inline]
+    pub(crate) fn table(&self) -> &Table {
+        &self.bs.t
+    }
+
+    /// Block of a state, same as `view().block(s)`: for loops that read many cells.
+    #[inline]
+    pub(crate) fn state_block(&self, s: u32) -> u16 {
+        self.data.states.get(s as usize).map_or(u16::MAX, |i| i.block)
+    }
+
+    pub(crate) fn top_y(&self) -> i32 {
+        self.dim.height.min_y + self.dim.height.sections as i32 * 16
+    }
+
+    pub(crate) fn in_build_height(&self, y: i32) -> bool {
+        (self.dim.height.min_y..self.top_y()).contains(&y)
+    }
+
+    /// State at `p`; void air outside the height or chunk absent.
+    #[inline]
+    pub(crate) fn get(&self, p: P) -> u32 {
+        crate::play::block_at(&self.chunks, self.dim.height.min_y, p)
+            .unwrap_or_else(|| self.view().default_state(self.bs.t.id.void_air))
+    }
+
+    /// Cells of the box `min..=max` (inclusive corners) whose state satisfies `pred`, in the
+    /// game's box scan order: sections along x, then z, then y; inside a section, cells along
+    /// y, then z, then x. `f` returns false to stop the scan (then `true` is returned). A section
+    /// whose palette cannot hold such a state is skipped without reading its data; cells outside
+    /// the world height or in an unloaded chunk are never visited (no caller looks for air).
+    pub(crate) fn scan_box(&self, min: P, max: P, pred: impl Fn(u32) -> bool, mut f: impl FnMut(P, u32) -> bool) -> bool {
+        let min_y = self.dim.height.min_y;
+        let (y0, y1) = (min[1].max(min_y), max[1].min(self.top_y() - 1));
+        if y0 > y1 {
+            return false;
+        }
+        let palette = scan_palette();
+        for sx in (min[0] >> 4)..=(max[0] >> 4) {
+            for sz in (min[2] >> 4)..=(max[2] >> 4) {
+                let Some(Some(c)) = self.chunks.get(&(sx, sz)) else { continue };
+                for si in ((y0 - min_y) >> 4)..=((y1 - min_y) >> 4) {
+                    let Some(sec) = c.sections.get(si as usize) else { continue };
+                    if palette && !sec.blocks.may_contain(&pred) {
+                        continue;
+                    }
+                    let (ox, oy, oz) = (sx << 4, min_y + (si << 4), sz << 4);
+                    for y in y0.max(oy)..=y1.min(oy + 15) {
+                        for z in min[2].max(oz)..=max[2].min(oz + 15) {
+                            for x in min[0].max(ox)..=max[0].min(ox + 15) {
+                                let i = block_index((x - ox) as usize, (y - oy) as usize, (z - oz) as usize);
+                                let s = sec.blocks.get(i);
+                                if pred(s) && !f([x, y, z], s) {
+                                    return true;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    /// Could a cell of the box `min..=max` (inclusive corners) hold a state satisfying `pred`?
+    /// False only when no section touching the box can: the palettes are read, never the cells
+    /// (a section stored without a palette answers yes; a palette may still list a state no cell
+    /// uses any more). Like `scan_box`, cells outside the world height or in an unloaded chunk do
+    /// not count.
+    pub(crate) fn box_may_contain(&self, min: P, max: P, pred: impl Fn(u32) -> bool) -> bool {
+        let min_y = self.dim.height.min_y;
+        let (y0, y1) = (min[1].max(min_y), max[1].min(self.top_y() - 1));
+        if y0 > y1 || min[0] > max[0] || min[2] > max[2] {
+            return false;
+        }
+        for sx in (min[0] >> 4)..=(max[0] >> 4) {
+            for sz in (min[2] >> 4)..=(max[2] >> 4) {
+                let Some(Some(c)) = self.chunks.get(&(sx, sz)) else { continue };
+                for si in ((y0 - min_y) >> 4)..=((y1 - min_y) >> 4) {
+                    if c.sections.get(si as usize).is_some_and(|sec| sec.blocks.may_contain(&pred)) {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    /// No more than `n` cells of the box `p + lo ..= p + hi` hold the block `b` (spread limit of
+    /// vines and mushrooms).
+    pub(crate) fn at_most_in_box(&self, p: P, lo: P, hi: P, b: u16, n: usize) -> bool {
+        let mut seen = 0;
+        let v = self.view();
+        let min = [p[0] + lo[0], p[1] + lo[1], p[2] + lo[2]];
+        let max = [p[0] + hi[0], p[1] + hi[1], p[2] + hi[2]];
+        !self.scan_box(min, max, |s| v.block(s) == b, |_, _| {
+            seen += 1;
+            seen <= n
+        })
+    }
+
+    pub(crate) fn is_loaded(&self, p: P) -> bool {
+        matches!(self.chunks.get(&(p[0] >> 4, p[2] >> 4)), Some(Some(_)))
+    }
+
+    /// The chunk of `p` and its 8 neighbours are loaded ("within block tick range", § 1.4).
+    pub(crate) fn ticking_at(&self, p: P) -> bool {
+        let (cx, cz) = (p[0] >> 4, p[2] >> 4);
+        self.chunk_simulated_now((cx, cz))
+            && (-1..=1).all(|dx| (-1..=1).all(|dz| matches!(self.chunks.get(&(cx + dx, cz + dz)), Some(Some(_)))))
+    }
+
+    /// Does a block entity at `p` tick this tick? Within the world border (column of the block)
+    /// and in a chunk within block tick range. Same test for all block entities, whether they
+    /// go through the common ticker list or through their own loop (furnaces, brewing stands,
+    /// spawners): outside the border, a furnace no longer cooks, a hopper no longer transfers.
+    pub(crate) fn be_ticking(&self, p: P) -> bool {
+        Self::block_in_border(self.border_bounds(), p) && self.ticking_at(p)
+    }
+
+    #[inline]
+    pub(crate) fn fluid_of(&self, s: u32) -> Fluid {
+        fluid_of_state(&self.bs.t, &self.data, s)
+    }
+
+    pub(crate) fn fluid_at(&self, p: P) -> Fluid {
+        self.fluid_of(self.get(p))
+    }
+
+    /// Liquid block of a fluid state, air if empty.
+    pub(crate) fn legacy_block(&self, f: Fluid) -> u32 {
+        let t = &self.bs.t;
+        let v = self.view();
+        match f.kind {
+            1 | 2 => {
+                let level = if f.source { 0 } else { 8 - i32::from(f.amount.min(8)) + if f.falling { 8 } else { 0 } };
+                if t.switches.liquid_state_table
+                    && let Some(s) = t.liquid_state(f.kind, level)
+                {
+                    return s;
+                }
+                let b = if f.kind == 1 { t.id.water } else { t.id.lava };
+                v.set_int(v.default_state(b), PropKey::Level, level)
+            }
+            _ => v.default_state(t.id.air),
+        }
+    }
+
+    pub(crate) fn air(&self) -> u32 {
+        self.states.air_state
+    }
+
+    /// Raw write into the section (no notification at all).
+    pub(super) fn write_raw(&mut self, p: P, state: u32) -> Option<u32> {
+        let min_y = self.dim.height.min_y;
+        let ly = p[1] - min_y;
+        let c = self.chunks.get_mut(&(p[0] >> 4, p[2] >> 4))?.as_mut()?;
+        let si = usize::try_from(ly >> 4).ok().filter(|&i| i < c.sections.len())?;
+        let idx = block_index((p[0] & 15) as usize, (ly & 15) as usize, (p[2] & 15) as usize);
+        let old = c.sections[si].blocks.get(idx);
+        if old == state {
+            return None;
+        }
+        let air = &self.states;
+        let direct = self.data.state_bits() as u8;
+        c.sections[si].set_blocks(&[(idx as u16, state)], direct, |s| air.is_air(s));
+        c.update_heightmaps(
+            (p[0] & 15) as usize,
+            p[1],
+            (p[2] & 15) as usize,
+            state,
+            &air.heightmap_rules,
+            self.dim.height,
+        );
+        c.changed[si] = true;
+        c.dirty = true;
+        self.random_tick_changed((p[0] >> 4, p[2] >> 4, si), old, state);
+        // The generation thread lights its new chunks from its own copy of the full ones.
+        if let Some(g) = &mut self.generator {
+            g.block_changes.record(p, state);
+        }
+        if crate::mobs::move_stats::enabled() {
+            crate::mobs::move_stats::column_written(p, self.tick);
+        }
+        if self.light.matters(old, state) {
+            let o = self.light_opts;
+            // Consecutive duplicate dropped (`misc`): exact, nothing moved between the two, it
+            // would join the same group without changing its box.
+            if !(o.misc && self.relight.last() == Some(&p)) {
+                self.relight.push(p);
+            }
+            if o.sky_list && self.light.matters_sky(old, state) && !(o.misc && self.relight_sky.last() == Some(&p)) {
+                self.relight_sky.push(p);
+            }
+        }
+        self.poi_block_changed(p, old, state); // F05: POI registry
+        Some(old)
+    }
+
+    /// Random-tick cache of the section after a change of `old` into `state`.
+    fn random_tick_changed(&mut self, key: (i32, i32, usize), old: u32, state: u32) {
+        if self.data.states.get(state as usize).is_some_and(|i| i.has(flags::RANDOM_TICK))
+            || self.fluid_of(state).kind == 2
+        {
+            self.bs.random_ticking_sections.insert(key, true);
+        } else if self.data.states.get(old as usize).is_some_and(|i| i.has(flags::RANDOM_TICK)) {
+            self.bs.random_ticking_sections.remove(&key);
+        }
+    }
+
+    /// Direct write into the section, like the game's ore veins in the live world: the section
+    /// counts its random ticks, but nothing else is told: no client update, light, height map,
+    /// block entity or point of interest, and the chunk is not marked for saving (the cell goes to
+    /// disk only if something else does mark it).
+    pub(crate) fn write_section_only(&mut self, p: P, state: u32) {
+        let ly = p[1] - self.dim.height.min_y;
+        let Some(Some(c)) = self.chunks.get_mut(&(p[0] >> 4, p[2] >> 4)) else { return };
+        let Some(si) = usize::try_from(ly >> 4).ok().filter(|&i| i < c.sections.len()) else { return };
+        let idx = block_index((p[0] & 15) as usize, (ly & 15) as usize, (p[2] & 15) as usize);
+        let old = c.sections[si].blocks.get(idx);
+        if old == state {
+            return;
+        }
+        let air = &self.states;
+        c.sections[si].set_blocks(&[(idx as u16, state)], self.data.state_bits() as u8, |s| air.is_air(s));
+        c.changed[si] = true;
+        self.random_tick_changed((p[0] >> 4, p[2] >> 4, si), old, state);
+        // Light is not told, but the game's light engine reads this block when it next spreads here.
+        if let Some(g) = &mut self.generator {
+            g.block_changes.record(p, state);
+        }
+    }
+
+    /// Placement with flags and shape depth 512.
+    pub(crate) fn set_block(&mut self, p: P, state: u32, flags: u32) -> bool {
+        self.set_block_limit(p, state, flags, 512)
+    }
+
+    /// Placement (§ 1.8, course in 11 steps).
+    pub(crate) fn set_block_limit(&mut self, p: P, state: u32, flags: u32, limit: i32) -> bool {
+        if !self.in_build_height(p[1]) {
+            return false;
+        }
+        let Some(old) = self.write_raw(p, state) else { return false };
+        let v = self.view();
+        let (ob, nb) = (v.block(old), v.block(state));
+        let block_changed = ob != nb;
+        let moved = flags & flag::MOVED != 0;
+        if block_changed && v.has_block_entity(old) && !self.keeps_block_entity(ob, nb) {
+            if flags & flag::SKIP_BE_SIDE_EFFECTS == 0 {
+                // Container contents thrown, furnace experience (every removal with side effects,
+                // `/setblock destroy` and mob breaks included).
+                self.container_broken(p);
+                // F14: creaking heart, shrieker.
+                self.rec_pre_remove(p, old);
+                // G6-F01: disc, book, pot item given back.
+                match self.view().kind(old) {
+                    Kind::Jukebox => self.jukebox_pre_remove(p, old),
+                    Kind::Lectern => self.lectern_pre_remove(p, old),
+                    Kind::DecoratedPot => self.pot_pre_remove(p),
+                    _ => {}
+                }
+            } else if self.view().kind(old) == Kind::Jukebox {
+                // The removal of the entity happens even without removal effects.
+                self.bs.be_ticks.remove(&p);
+                self.game_event_block("minecraft:jukebox_stop_play", p, None, Some(old));
+                self.level_event(1011, p, 0);
+            }
+            // G5-F11: the removed beacon turns off (sound), with or without removal effects.
+            if self.view().kind(old) == Kind::Beacon {
+                self.beacon_removed(p);
+            }
+            self.remove_block_entity(p);
+        }
+        let new_kind = self.view().kind(state);
+        if (block_changed || matches!(new_kind, Kind::Rail | Kind::PoweredRail | Kind::DetectorRail))
+            && (flags & flag::NEIGHBORS != 0 || moved)
+        {
+            self.affect_after_removal(old, p, moved);
+        }
+        if self.view().block(self.get(p)) != nb {
+            return false;
+        }
+        if flags & flag::SKIP_ON_PLACE == 0 {
+            self.on_place(state, p, old, moved);
+        }
+        if self.view().has_block_entity(state) && self.view().block(self.get(p)) == nb {
+            self.ensure_block_entity(p, state);
+            // G6-F01: jukebox ticker according to `has_record`.
+            if new_kind == Kind::Jukebox && self.get(p) == state {
+                self.jukebox_ticker_sync(p, state);
+            }
+            // G6-F09a: active sulfur ticker follows its state (on every state change).
+            if new_kind == Kind::PotentSulfur && self.get(p) == state {
+                self.potent_sulfur_ticker_sync(p, state);
+            }
+        }
+        if self.get(p) == state {
+            if flags & flag::CLIENTS != 0 {
+                self.changed.push(p);
+            }
+            if flags & flag::NEIGHBORS != 0 {
+                self.update_neighbors_at(p, ob);
+                if self.view().has_analog(state) {
+                    self.update_neighbour_for_output_signal(p, nb);
+                }
+            }
+            if flags & flag::KNOWN_SHAPE == 0 && limit > 0 {
+                let nf = flags & !(flag::NEIGHBORS | flag::NO_DROPS);
+                self.update_indirect_shapes(old, p, nf, limit - 1);
+                self.update_neighbour_shapes(state, p, nf, limit - 1);
+                self.update_indirect_shapes(state, p, nf, limit - 1);
+            }
+        }
+        true
+    }
+
+    /// The new block keeps the block entity of the old one:
+    /// copper chests among themselves, copper golem statues among themselves (oxidation, wax,
+    /// unwaxing); the contents or the pose are not lost.
+    fn keeps_block_entity(&self, ob: u16, nb: u16) -> bool {
+        ["minecraft:copper_chests", "minecraft:copper_golem_statues"]
+            .iter()
+            .any(|t| self.tag(t, nb) && self.tag(t, ob))
+    }
+
+    /// Flags 3.
+    pub(crate) fn set_update(&mut self, p: P, state: u32) -> bool {
+        self.set_block(p, state, flag::ALL)
+    }
+
+    /// Removal (remaining fluid, falling bit included): flags 3 (+64 by piston).
+    pub(crate) fn remove_block(&mut self, p: P, moved: bool) -> bool {
+        let s = self.remaining_fluid_block(self.fluid_at(p));
+        self.set_block(p, s, flag::ALL | if moved { flag::MOVED } else { 0 })
+    }
+
+    /// The block left where a block is removed or destroyed: the liquid of its fluid as it is
+    /// (a falling one stays falling), air without fluid.
+    pub(crate) fn remaining_fluid_block(&self, f: Fluid) -> u32 {
+        if f.is_empty() { self.air() } else { self.legacy_block(f) }
+    }
+
+    /// Destruction (loot not handled): particles and sound (event 2001), remaining fluid.
+    pub(crate) fn destroy_block(&mut self, p: P, drop: bool, limit: i32) -> bool {
+        self.destroy_block_by(p, drop, limit, None)
+    }
+
+    /// Destruction with the entity that breaks: if the placement succeeds, `block_destroy` event
+    /// (entity, old state).
+    pub(crate) fn destroy_block_by(
+        &mut self,
+        p: P,
+        drop: bool,
+        limit: i32,
+        by: Option<crate::mobs::recent::vibration::Src>,
+    ) -> bool {
+        let state = self.get(p);
+        if self.view().is_air(state) {
+            return false;
+        }
+        // Break particles; the straw bed has its own, without sound (2014); fire (and soul fire)
+        // breaks with no effect at all.
+        let fire = [self.bs.t.id.fire, self.bs.t.id.soul_fire].contains(&self.view().block(state));
+        if !fire {
+            let straw = self.data.block_of(state).is_some_and(|b| b.name == "minecraft:straw_bed");
+            self.level_event(if straw { 2014 } else { 2001 }, p, state as i32);
+        }
+        // Loot before removal (empty tool), then after-break effects.
+        if drop {
+            self.drop_resources(p, state, None);
+        }
+        let s = self.remaining_fluid_block(self.fluid_of(state));
+        let done = self.set_block_limit(p, s, flag::ALL, limit);
+        if done {
+            let c = [f64::from(p[0]) + 0.5, f64::from(p[1]) + 0.5, f64::from(p[2]) + 0.5];
+            self.game_event_src("minecraft:block_destroy", c, by, Some(state));
+        }
+        done
+    }
+
+    /// Priming of a TNT block: refused without the rule `tnt_explodes`;
+    /// otherwise primed TNT, priming sound at its position, `prime_fuse` event of the author.
+    pub(crate) fn tnt_prime_block(&mut self, p: P, by: Option<crate::mobs::mob::Ent>) -> bool {
+        self.tnt_prime_block_with(p, by, None)
+    }
+
+    /// Like `tnt_prime_block`, with the lighting item: an adventure-mode player only primes
+    /// if this item has `can_break` for the block. The primed TNT keeps its author.
+    pub(crate) fn tnt_prime_block_with(
+        &mut self,
+        p: P,
+        by: Option<crate::mobs::mob::Ent>,
+        item: Option<&crate::player::Stack>,
+    ) -> bool {
+        if !self.rule("minecraft:tnt_explodes", true) {
+            return false;
+        }
+        if by == Some(crate::mobs::mob::Ent::Player) && self.game_mode == 2 && !self.adventure_can_break(item, p) {
+            return false;
+        }
+        self.tnt_prime_by(p, by);
+        let at = [f64::from(p[0]) + 0.5, f64::from(p[1]), f64::from(p[2]) + 0.5];
+        self.world_sound("minecraft:entity.tnt.primed", 4, at, 1.0, 1.0);
+        self.game_event_block("minecraft:prime_fuse", p, by, None);
+        true
+    }
+
+    /// Loot of a block broken by something other than a player: table `blocks/<name>` (tool given or empty, block
+    /// entity still in place), items placed at the center of the block, then the after-break effects
+    /// (experience of ores without Silk Touch, silverfish of infested blocks).
+    pub(crate) fn drop_resources(&mut self, p: P, state: u32, tool: Option<&crate::player::Stack>) {
+        let drops = self.block_drops(p, state, tool);
+        for d in drops {
+            self.pop_resource(p, d);
+        }
+        let Some(block) = self.data.block_of(state).map(|b| b.name.clone()) else { return };
+        self.drop_block_xp(p, &block, tool);
+        self.infested_broken(p, &block, tool);
+    }
+
+    /// Items drawn from the loot table of the block (tool present but possibly empty).
+    pub(crate) fn block_drops(
+        &mut self,
+        p: P,
+        state: u32,
+        tool: Option<&crate::player::Stack>,
+    ) -> Vec<crate::player::Stack> {
+        if !self.rule("minecraft:block_drops", true) {
+            return Vec::new();
+        }
+        if !crate::loot::loot_context_borrowed() {
+            return self.block_drops_with_owned_context(p, state, tool);
+        }
+        self.draw_block_loot(p, state, crate::block_loot::BlockRemoval::Mined { tool, by_player: false })
+    }
+
+    pub(crate) fn level_event(&self, kind: i32, p: P, data: i32) {
+        let _ = self.send(Event::LevelEvent { kind, pos: p, data, global: false });
+    }
+
+    /// World event "heard everywhere" (wither spawning, dragon death, End
+    /// portal): rule `global_sound_events` true, sent to each player, position brought back
+    /// to 32 blocks from them (a player of another world hears it where it stands, like the
+    /// game); false, ordinary event.
+    pub(crate) fn global_level_event(&self, kind: i32, p: P, data: i32) {
+        if !self.rule("minecraft:global_sound_events", true) {
+            self.level_event(kind, p, data);
+            return;
+        }
+        let c = [f64::from(p[0]) + 0.5, f64::from(p[1]) + 0.5, f64::from(p[2]) + 0.5];
+        self.send_each_player_at(|at, here| {
+            if !here {
+                return Event::LevelEvent { kind, pos: crate::mobs::mth::block_of(at), data, global: true };
+            }
+            let d = [c[0] - at[0], c[1] - at[1], c[2] - at[2]];
+            let d2 = d[0] * d[0] + d[1] * d[1] + d[2] * d[2];
+            let sound = if d2 < 32.0 * 32.0 {
+                c
+            } else {
+                let l = d2.sqrt();
+                let n = if l < f64::from(1.0e-5f32) { [0.0; 3] } else { d.map(|v| v / l) };
+                [at[0] + n[0] * 32.0, at[1] + n[1] * 32.0, at[2] + n[2] * 32.0]
+            };
+            Event::LevelEvent { kind, pos: crate::mobs::mth::block_of(sound), data, global: true }
+        });
+    }
+
+    /// The update of a block or its destruction.
+    pub(crate) fn update_or_destroy(&mut self, old: u32, new: u32, p: P, flags: u32, limit: i32) {
+        if new != old {
+            if self.view().is_air(new) {
+                self.destroy_block(p, flags & flag::NO_DROPS == 0, limit);
+            } else {
+                self.set_block_limit(p, new, flags & !flag::NO_DROPS, limit);
+            }
+        }
+    }
+
+    /// State adjusted by the shapes of the 6 neighbours.
+    pub(crate) fn update_from_neighbour_shapes(&mut self, state: u32, p: P) -> u32 {
+        let mut s = state;
+        for d in Dir::SHAPE_ORDER {
+            let np = rel(p, d);
+            let ns = self.get(np);
+            s = self.update_shape(s, p, d, np, ns);
+        }
+        s
+    }
+
+    // --- Notification scheduler (§ 1.8). ---
+
+    fn add_and_run(&mut self, job: Job) {
+        let running = self.bs.count > 0;
+        let max = self.bs.max_chained;
+        let too_many = max >= 0 && self.bs.count >= max;
+        self.bs.count += 1;
+        if !too_many {
+            if running {
+                self.bs.added.push(job);
+            } else {
+                self.bs.stack.push(job);
+            }
+        } else if self.bs.count - 1 == max {
+            eprintln!("singleplayer: too many chained neighbour updates, the rest is ignored");
+        }
+        if !running {
+            self.run_updates();
+        }
+    }
+
+    fn run_updates(&mut self) {
+        while !self.bs.stack.is_empty() || !self.bs.added.is_empty() {
+            while let Some(j) = self.bs.added.pop() {
+                self.bs.stack.push(j);
+            }
+            // `added` emptied in reverse order: the first added is at the top.
+            let top = self.bs.stack.len() - 1;
+            loop {
+                let mut job = self.bs.stack[top];
+                let more = self.run_step(&mut job);
+                if !more {
+                    self.bs.stack.pop();
+                    break;
+                }
+                self.bs.stack[top] = job;
+                if !self.bs.added.is_empty() {
+                    break;
+                }
+            }
+        }
+        self.bs.stack.clear();
+        self.bs.added.clear();
+        self.bs.count = 0;
+    }
+
+    fn run_step(&mut self, job: &mut Job) -> bool {
+        match *job {
+            Job::Shape { dir, nstate, pos, npos, flags, limit } => {
+                self.execute_shape_update(dir, pos, npos, nstate, flags, limit);
+                false
+            }
+            Job::Simple { pos, block, orientation } => {
+                let s = self.get(pos);
+                self.neighbor_changed(s, pos, block, false, orientation);
+                false
+            }
+            Job::Full { state, pos, block, moved, orientation } => {
+                self.neighbor_changed(state, pos, block, moved, orientation);
+                false
+            }
+            Job::Multi { src, block, skip, ref mut idx, ref mut orientation } => {
+                // Under the experiments, a series started without one draws its orientation at its
+                // first neighbour, facing away from the skipped side.
+                if orientation.is_none() && self.redstone_experiments {
+                    *orientation = self.experimental_orientation(skip.map(Dir::opposite), None);
+                }
+                let d = Dir::UPDATE_ORDER[*idx as usize];
+                *idx += 1;
+                let np = rel(src, d);
+                let s = self.get(np);
+                self.neighbor_changed(s, np, block, false, orientation.map(|o| o.with_front(d)));
+                if (*idx as usize) < 6 && Some(Dir::UPDATE_ORDER[*idx as usize]) == skip {
+                    *idx += 1;
+                }
+                (*idx as usize) < 6
+            }
+        }
+    }
+
+    fn execute_shape_update(&mut self, dir: Dir, pos: P, npos: P, nstate: u32, flags: u32, limit: i32) {
+        let cur = self.get(pos);
+        if flags & flag::SKIP_WIRE_SHAPE != 0 && self.view().kind(cur) == Kind::Wire {
+            return;
+        }
+        let new = self.update_shape(cur, pos, dir, npos, nstate);
+        self.update_or_destroy(cur, new, pos, flags, limit);
+    }
+
+    /// Orientation of an update a source starts, under the redstone experiments: one draw of the
+    /// level's random, turned to the left, then to `up` and to `front` when the source imposes
+    /// them. Without the experiments: `None`, and no draw.
+    pub(crate) fn experimental_orientation(&mut self, front: Option<Dir>, up: Option<Dir>) -> Option<Orientation> {
+        if !self.redstone_experiments {
+            return None;
+        }
+        let mut o = Orientation::random(&mut self.bs.rng).with_side_bias(SideBias::Left);
+        if let Some(up) = up {
+            o = o.with_up(up);
+        }
+        if let Some(front) = front {
+            o = o.with_front(front);
+        }
+        Some(o)
+    }
+
+    /// "Neighbour changed" to the 6 neighbours of `p` (order west, east, down, up, north, south),
+    /// with a freshly drawn orientation under the redstone experiments.
+    pub(crate) fn update_neighbors_at(&mut self, p: P, block: u16) {
+        let orientation = self.experimental_orientation(None, None);
+        self.update_neighbors_oriented(p, block, orientation);
+    }
+
+    /// The same with the orientation the source gives (drawn once for several series).
+    pub(crate) fn update_neighbors_oriented(&mut self, p: P, block: u16, orientation: Option<Orientation>) {
+        self.add_and_run(Job::Multi { src: p, block, skip: None, idx: 0, orientation });
+    }
+
+    pub(crate) fn update_neighbors_except(&mut self, p: P, block: u16, skip: Dir, orientation: Option<Orientation>) {
+        let idx = u8::from(Dir::UPDATE_ORDER[0] == skip);
+        self.add_and_run(Job::Multi { src: p, block, skip: Some(skip), idx, orientation });
+    }
+
+    /// Simple "neighbour changed" at `p` (state re-read at the time of the step).
+    pub(crate) fn neighbor_changed_at(&mut self, p: P, block: u16) {
+        self.neighbor_changed_oriented(p, block, None);
+    }
+
+    /// The same, carrying `orientation` (redstone experiments).
+    pub(crate) fn neighbor_changed_oriented(&mut self, p: P, block: u16, orientation: Option<Orientation>) {
+        self.add_and_run(Job::Simple { pos: p, block, orientation });
+    }
+
+    /// Full "neighbour changed" (state provided).
+    pub(crate) fn neighbor_changed_full(&mut self, state: u32, p: P, block: u16, moved: bool) {
+        self.neighbor_changed_full_oriented(state, p, block, moved, None);
+    }
+
+    /// The same, carrying `orientation` (redstone experiments).
+    pub(crate) fn neighbor_changed_full_oriented(
+        &mut self,
+        state: u32,
+        p: P,
+        block: u16,
+        moved: bool,
+        orientation: Option<Orientation>,
+    ) {
+        self.add_and_run(Job::Full { state, pos: p, block, moved, orientation });
+    }
+
+    /// Shape update sent to `pos`: its neighbour `npos` (in direction `dir` seen from
+    /// `pos`) became `nstate`.
+    pub(crate) fn neighbor_shape_changed(&mut self, dir: Dir, pos: P, npos: P, nstate: u32, flags: u32, limit: i32) {
+        self.add_and_run(Job::Shape { dir, nstate, pos, npos, flags, limit });
+    }
+
+    /// Shapes of the 6 neighbours (order west, east, north, south, down, up).
+    pub(crate) fn update_neighbour_shapes(&mut self, state: u32, p: P, flags: u32, limit: i32) {
+        for d in Dir::SHAPE_ORDER {
+            let np = rel(p, d);
+            self.neighbor_shape_changed(d.opposite(), np, p, state, flags, limit);
+        }
+    }
+
+    /// "Indirect" shapes (only dust has them, § 3.3).
+    pub(crate) fn update_indirect_shapes(&mut self, state: u32, p: P, flags: u32, limit: i32) {
+        if self.view().kind(state) == Kind::Wire {
+            self.wire_indirect_shapes(state, p, flags, limit);
+        }
+    }
+
+    /// Comparator update (§ 3.5).
+    pub(crate) fn update_neighbour_for_output_signal(&mut self, p: P, block: u16) {
+        for d in Dir::HORIZONTAL {
+            let mut q = rel(p, d);
+            if !self.is_loaded(q) {
+                continue;
+            }
+            let s = self.get(q);
+            if self.view().kind(s) == Kind::Comparator {
+                self.neighbor_changed_full(s, q, block, false);
+            } else if self.view().conductor(s) {
+                q = rel(q, d);
+                let s = self.get(q);
+                if self.view().kind(s) == Kind::Comparator {
+                    self.neighbor_changed_full(s, q, block, false);
+                }
+            }
+        }
+    }
+
+    // --- Block entities (data kept in the chunk NBT). ---
+
+    pub(crate) fn be_index(&self, p: P) -> Option<usize> {
+        let c = self.chunks.get(&(p[0] >> 4, p[2] >> 4))?.as_ref()?;
+        c.block_entities.iter().position(|v| {
+            crate::nbtio::int(v, "x") == Some(i64::from(p[0]))
+                && crate::nbtio::int(v, "y") == Some(i64::from(p[1]))
+                && crate::nbtio::int(v, "z") == Some(i64::from(p[2]))
+        })
+    }
+
+    pub(crate) fn be_get(&self, p: P) -> Option<&rc_proto::nbt::Nbt> {
+        let i = self.be_index(p)?;
+        self.chunks.get(&(p[0] >> 4, p[2] >> 4))?.as_ref()?.block_entities.get(i)
+    }
+
+    pub(crate) fn be_get_mut(&mut self, p: P) -> Option<&mut rc_proto::nbt::Nbt> {
+        let i = self.be_index(p)?;
+        let c = self.chunks.get_mut(&(p[0] >> 4, p[2] >> 4))?.as_mut()?;
+        c.dirty = true;
+        c.block_entities.get_mut(i)
+    }
+
+    pub(crate) fn remove_block_entity(&mut self, p: P) {
+        self.bs.movers.remove(&p);
+        // G3-F13: its ticker dies with it (dropped on the next walk); a block entity placed back
+        // at the same position gets a new ticker at the end of the list, like the game. The state
+        // kept outside the block entity goes too (thrown first by `container_broken` when the
+        // removal has side effects; lost without them, like the game), otherwise a furnace placed
+        // back there would find the old one's.
+        if let Some((_, t)) = self.bs.be_ticks.remove(&p) {
+            self.dead_ticker_state(p, t);
+        }
+        if let Some(i) = self.be_index(p)
+            && let Some(Some(c)) = self.chunks.get_mut(&(p[0] >> 4, p[2] >> 4))
+        {
+            c.block_entities.remove(i);
+            c.dirty = true;
+        }
+    }
+
+    /// Creates the block entity of a new state if missing (minimal NBT).
+    fn ensure_block_entity(&mut self, p: P, state: u32) {
+        if self.be_index(p).is_some() || self.view().kind(state) == Kind::MovingPiston {
+            return;
+        }
+        let Some(fields) = self.new_block_entity_nbt(p, state) else { return };
+        if let Some(Some(c)) = self.chunks.get_mut(&(p[0] >> 4, p[2] >> 4)) {
+            c.block_entities.push(fields);
+            c.dirty = true;
+        }
+        self.after_block_entity_created(p, state);
+    }
+
+    /// The block entity a block of `state` at `p` starts with (its type's id, position and
+    /// default data), `None` if the block has none.
+    pub(crate) fn new_block_entity_nbt(&self, p: P, state: u32) -> Option<rc_proto::nbt::Nbt> {
+        let name = self.data.block_of(state).map_or("", |b| b.name.as_str());
+        let id = crate::blocks::entities::block_entity_id(name)?;
+        use rc_proto::nbt::Nbt;
+        let mut fields = vec![
+            ("id".to_owned(), Nbt::String(id.to_owned())),
+            ("x".to_owned(), Nbt::Int(p[0])),
+            ("y".to_owned(), Nbt::Int(p[1])),
+            ("z".to_owned(), Nbt::Int(p[2])),
+        ];
+        if id == "minecraft:comparator" {
+            fields.push(("OutputSignal".to_owned(), Nbt::Int(0)));
+        }
+        // G6-F09a: active sulfur countdown, -1 until it has been drawn.
+        if id == "minecraft:potent_sulfur" {
+            fields.push(("countdown".to_owned(), Nbt::Int(-1)));
+        }
+        // A crafter's block entity starts with the signal its placed state already shows.
+        if id == "minecraft:crafter" && self.view().get_bool(state, PropKey::Triggered) {
+            fields.push(("triggered".to_owned(), Nbt::Int(1)));
+        }
+        // A catalyst always saves its charge list, even before it heard anything.
+        if id == "minecraft:sculk_catalyst" {
+            fields.push(("cursors".to_owned(), Nbt::List(Vec::new())));
+        }
+        Some(Nbt::Compound(fields))
+    }
+
+    pub(crate) fn be_int(&self, p: P, key: &str) -> i32 {
+        self.be_get(p).and_then(|v| crate::nbtio::int(v, key)).unwrap_or(0) as i32
+    }
+
+    pub(crate) fn be_set_int(&mut self, p: P, key: &str, value: i32) {
+        if let Some(v) = self.be_get_mut(p) {
+            crate::nbtio::set(v, key, rc_proto::nbt::Nbt::Int(value));
+        }
+    }
+
+    // --- Scheduled ticks. ---
+
+    pub(crate) fn schedule_tick(&mut self, p: P, block: u16, delay: i32) {
+        self.schedule_tick_priority(p, block, delay, 0);
+    }
+
+    pub(crate) fn schedule_tick_priority(&mut self, p: P, block: u16, delay: i32, priority: i8) {
+        let sub = self.bs.sub_tick;
+        self.bs.sub_tick += 1;
+        if !self.is_loaded(p) {
+            return;
+        }
+        let at = self.time + i64::from(delay);
+        if self.bs.block_ticks.schedule(p, u32::from(block), at, priority, sub) {
+            self.mark_dirty(p);
+        }
+    }
+
+    pub(crate) fn schedule_fluid_tick(&mut self, p: P, fluid_type: u8, delay: i32) {
+        let sub = self.bs.sub_tick;
+        self.bs.sub_tick += 1;
+        if !self.is_loaded(p) {
+            return;
+        }
+        let at = self.time + i64::from(delay);
+        if self.bs.fluid_ticks.schedule(p, u32::from(fluid_type), at, 0, sub) {
+            self.mark_dirty(p);
+        }
+    }
+
+    pub(crate) fn has_scheduled_tick(&self, p: P, block: u16) -> bool {
+        self.bs.block_ticks.has(p, u32::from(block))
+    }
+
+    pub(crate) fn will_tick_this_tick(&self, p: P, block: u16) -> bool {
+        self.bs.block_ticks.will_tick_this_tick(p, u32::from(block))
+    }
+
+    pub(crate) fn mark_dirty(&mut self, p: P) {
+        if let Some(Some(c)) = self.chunks.get_mut(&(p[0] >> 4, p[2] >> 4)) {
+            c.dirty = true;
+        }
+    }
+
+    pub(crate) fn block_event(&mut self, p: P, block: u16, a: i32, b: i32) {
+        let e = BlockEvent { pos: p, block, a, b };
+        if self.bs.event_set.insert(e) {
+            self.bs.events.push_back(e);
+        }
+    }
+
+    // --- Dispatch. ---
+
+    pub(crate) fn on_place(&mut self, state: u32, p: P, old: u32, moved: bool) {
+        let v = self.view();
+        let same_block = v.block(old) == v.block(state);
+        if !same_block && self.state_name(state) == "minecraft:sponge" {
+            self.sponge_absorb(p);
+            return;
+        }
+        match v.kind(state) {
+            Kind::Wire => {
+                if !same_block {
+                    self.wire_on_place(state, p);
+                }
+            }
+            Kind::Repeater | Kind::Comparator => self.diode_update_in_front(p, state),
+            Kind::RedstoneTorch | Kind::RedstoneWallTorch => self.torch_notify(p, state),
+            Kind::Observer => {
+                if !same_block {
+                    self.observer_on_place(state, p);
+                }
+            }
+            Kind::Piston { .. } => {
+                if !same_block && !self.bs.movers.contains_key(&p) && self.be_get(p).is_none() {
+                    self.piston_check(p, state);
+                }
+            }
+            Kind::Water | Kind::Lava => self.liquid_on_place(state, p),
+            Kind::Falling { .. } | Kind::Anvil | Kind::ConcretePowder => {
+                let b = v.block(state);
+                self.schedule_tick(p, b, 2);
+            }
+            Kind::DragonEgg => {
+                let b = v.block(state);
+                self.schedule_tick(p, b, 5);
+            }
+            Kind::Fire | Kind::SoulFire => self.fire_on_place(state, p, old),
+            Kind::Tnt => {
+                if !same_block && self.has_neighbor_signal(p) && self.tnt_prime_block(p, None) {
+                    self.remove_block(p, false);
+                }
+            }
+            Kind::Hopper => {
+                if !same_block {
+                    self.hopper_check_powered(p, state);
+                }
+            }
+            Kind::CopperBulb => {
+                if !same_block {
+                    self.copper_bulb_check(p, state);
+                }
+            }
+            Kind::Rail | Kind::PoweredRail | Kind::DetectorRail if !same_block => {
+                self.rail_on_place(p, state, moved);
+            }
+            Kind::Tripwire if !same_block => self.tripwire_update_source(p, state),
+            Kind::Scaffolding => {
+                let b = v.block(state);
+                self.schedule_tick(p, b, 1);
+            }
+            Kind::Support(Sup::CoralBelow { alive: true } | Sup::CoralWall { alive: true }) => {
+                self.coral_try_schedule_death(state, p);
+            }
+            Kind::Shelf => self.shelf_on_place(p, state, old), // G6-F01: side chain
+            Kind::PotentSulfur => self.potent_sulfur_on_place(state, p), // G6-F09a
+            // Frosted ice: melt scheduled at each placement (age included), 60 to 120 ticks; the
+            // shorter delay drawn afterwards by its tick is then ignored (26.3).
+            Kind::FrostedIce => {
+                let b = v.block(state);
+                let delay = 60 + self.bs.rng.next_int_bound(61);
+                self.schedule_tick(p, b, delay);
+            }
+            // Lit target placed without a scheduled tick (command, structure): turned off (flags 18).
+            Kind::Target if !same_block => {
+                let b = v.block(state);
+                if v.get_int(state, PropKey::Power) > 0 && !self.has_scheduled_tick(p, b) {
+                    let off = v.set_int(state, PropKey::Power, 0);
+                    self.set_block(p, off, flag::CLIENTS | flag::KNOWN_SHAPE);
+                }
+            }
+            _ => match self.state_name(state) {
+                // Composter placed at level 7: goes to 8 in 20 ticks.
+                "minecraft:composter" if v.get_int(state, PropKey::Level) == 7 => {
+                    let b = v.block(state);
+                    self.schedule_tick(p, b, 20);
+                }
+                // Wet sponge where water evaporates: dried at once (smoke 2009, sound).
+                "minecraft:wet_sponge" if self.dim.name == "minecraft:the_nether" => {
+                    let dry = self.default_state("minecraft:sponge");
+                    self.set_update(p, dry);
+                    self.level_event(2009, p, 0);
+                    let pitch = (1.0 + self.bs.rng.next_float() * 0.2) * 0.7;
+                    self.block_sound(p, "minecraft:block.wet_sponge.dries", 1.0, pitch);
+                }
+                _ => {}
+            },
+        }
+        // G6-F10: sculk sensor placed lit without a scheduled tick → turned off.
+        self.sensor_on_place(state, p, same_block);
+        // F06: carved pumpkin or lantern placed → golem construction.
+        self.golem_on_place(state, p, old);
+        // Lightning rod placed already powered (copper stripped by lightning): scheduled turn-off.
+        self.lightning_rod_on_place(state, p, old);
+        // F10: frogspawn, sniffer egg (scheduled hatching).
+        self.bz_egg_on_place(state, p);
+        // G6-F08: turtle eggs on sand (growth particles).
+        self.turtle_egg_on_place(state, p);
+    }
+
+    pub(crate) fn affect_after_removal(&mut self, old: u32, p: P, moved: bool) {
+        let v = self.view();
+        match v.kind(old) {
+            Kind::Wire => {
+                if !moved {
+                    self.wire_on_remove(old, p);
+                }
+            }
+            Kind::Repeater | Kind::Comparator => {
+                if !moved {
+                    self.diode_update_in_front(p, old);
+                }
+            }
+            Kind::RedstoneTorch | Kind::RedstoneWallTorch => {
+                if !moved {
+                    self.torch_notify(p, old);
+                }
+            }
+            Kind::Observer => self.observer_on_remove(old, p),
+            Kind::Lever | Kind::Button { .. } => {
+                if !moved && v.get_bool(old, PropKey::Powered) {
+                    self.attached_update_neighbours(p, old);
+                }
+            }
+            Kind::Plate { .. } | Kind::WeightedPlate { .. } => {
+                if !moved && self.plate_signal(old) > 0 {
+                    self.plate_update_neighbours(p, old);
+                }
+            }
+            Kind::PistonHead => self.piston_head_removed(old, p),
+            Kind::Rail | Kind::PoweredRail | Kind::DetectorRail => self.rail_after_removal(old, p, moved),
+            Kind::Chest | Kind::Hopper | Kind::Dispenser | Kind::Dropper => {
+                self.update_neighbour_for_output_signal(p, v.block(old));
+            }
+            Kind::DaylightDetector | Kind::Target => {}
+            // G6-F01: shelf (comparators, detached neighbours); powered lectern (below).
+            Kind::Shelf => {
+                self.update_neighbour_for_output_signal(p, v.block(old));
+                self.shelf_powering_down(p, old);
+            }
+            Kind::Lectern => {
+                if v.get_bool(old, PropKey::Powered) {
+                    self.update_neighbors_at(below(p), v.block(old));
+                }
+            }
+            Kind::TripwireHook if !moved => self.hook_on_removed(old, p),
+            Kind::Tripwire if !moved => {
+                let s = v.set_bool(old, PropKey::Powered, true);
+                self.tripwire_update_source(p, s);
+            }
+            _ if self.sensor_after_removal(old, p) => {} // G6-F10: active sensor removed
+            _ if self.lightning_rod_removed(old, p) => {} // powered lightning rod removed
+            _ => {
+                let v = self.view();
+                if v.has_analog(old) && v.has_block_entity(old) {
+                    self.update_neighbour_for_output_signal(p, v.block(old));
+                }
+            }
+        }
+    }
+
+    /// "Neighbour changed" received by `state` at `p` from block `from`; `orientation`: what the
+    /// update carries under the redstone experiments (read by dust and piston heads).
+    pub(crate) fn neighbor_changed(&mut self, state: u32, p: P, from: u16, moved: bool, orientation: Option<Orientation>) {
+        if self.state_name(state) == "minecraft:sponge" {
+            self.sponge_absorb(p);
+            return;
+        }
+        let v = self.view();
+        match v.kind(state) {
+            Kind::Wire => self.wire_neighbor_changed(state, p, from, orientation),
+            Kind::Repeater | Kind::Comparator => self.diode_neighbor_changed(state, p),
+            Kind::RedstoneTorch | Kind::RedstoneWallTorch => self.torch_neighbor_changed(state, p),
+            Kind::Lamp => self.lamp_neighbor_changed(state, p),
+            Kind::Piston { .. } => self.piston_check(p, state),
+            Kind::PistonHead => self.piston_head_neighbor_changed(state, p, from, orientation),
+            Kind::Door { .. } => self.door_neighbor_changed(state, p, from),
+            Kind::Trapdoor { .. } => self.trapdoor_neighbor_changed(state, p),
+            Kind::FenceGate => self.gate_neighbor_changed(state, p),
+            Kind::Water | Kind::Lava => self.liquid_neighbor_changed(state, p),
+            Kind::Dispenser | Kind::Dropper | Kind::Crafter => self.dispenser_neighbor_changed(state, p),
+            Kind::Hopper => self.hopper_check_powered(p, state),
+            Kind::Tnt => {
+                if self.has_neighbor_signal(p) && self.tnt_prime_block(p, None) {
+                    self.remove_block(p, false);
+                }
+            }
+            Kind::NoteBlock => self.note_neighbor_changed(state, p),
+            Kind::CopperBulb => self.copper_bulb_check(p, state),
+            Kind::Rail | Kind::PoweredRail | Kind::DetectorRail => self.rail_neighbor_changed(state, p, from),
+            // Frosted ice warned by a neighbouring frosted ice: melts if fewer than two
+            // frosted neighbours remain.
+            Kind::FrostedIce if from == v.block(state) => {
+                let b = v.block(state);
+                let near = Dir::ALL.iter().filter(|&&d| self.view().block(self.get(rel(p, d))) == b).count();
+                if near < 2 {
+                    self.frosted_ice_melt(p);
+                }
+            }
+            Kind::Shelf => self.shelf_neighbor_changed(p, state), // G6-F01
+            // Bell: rings on the rising edge, powered state tracked (flags 3).
+            Kind::Bell => {
+                let signal = self.has_neighbor_signal(p);
+                if signal != v.get_bool(state, PropKey::Powered) {
+                    if signal {
+                        self.bell_attempt_ring(p, None, None);
+                    }
+                    let ns = self.view().set_bool(state, PropKey::Powered, signal);
+                    self.set_update(p, ns);
+                }
+            }
+            // Powered head: the animation (dragon mouth, piglin) follows the signal (flag 2).
+            Kind::Skull => {
+                let signal = self.has_neighbor_signal(p);
+                if v.has(state, PropKey::Powered) && signal != v.get_bool(state, PropKey::Powered) {
+                    let ns = self.view().set_bool(state, PropKey::Powered, signal);
+                    self.set_block(p, ns, flag::CLIENTS);
+                }
+            }
+            Kind::BigDripleaf => self.dripleaf_neighbor_changed(state, p),
+            // G6-F14: structure and test blocks follow the signal.
+            Kind::Structure | Kind::Test => {
+                self.tech_neighbor_changed(state, p);
+            }
+            _ => self.cmdblock_neighbor_changed(state, p), // S5
+        }
+        let _ = moved;
+    }
+
+    pub(crate) fn tick_block(&mut self, state: u32, p: P) {
+        let v = self.view();
+        match v.kind(state) {
+            Kind::Repeater => self.diode_tick(state, p),
+            Kind::Comparator => self.comparator_refresh(p, state),
+            Kind::RedstoneTorch | Kind::RedstoneWallTorch => self.torch_tick(state, p),
+            Kind::Lamp => self.lamp_tick(state, p),
+            Kind::Observer => self.observer_tick(state, p),
+            Kind::Button { .. } => self.button_tick(state, p),
+            Kind::Plate { .. } | Kind::WeightedPlate { .. } => self.plate_tick(state, p),
+            Kind::DetectorRail => self.detector_rail_tick(state, p), // G5-F06
+            Kind::Dispenser | Kind::Dropper | Kind::Crafter => self.dispenser_tick(state, p),
+            Kind::Target => self.target_tick(state, p),
+            Kind::Falling { .. } | Kind::Anvil | Kind::ConcretePowder | Kind::DragonEgg => self.falling_tick(state, p),
+            Kind::TripwireHook => self.hook_tick(state, p),
+            Kind::Tripwire => self.tripwire_tick(state, p),
+            Kind::Bamboo { sapling: false } => self.bamboo_tick(p),
+            Kind::Scaffolding => self.scaffold_tick(state, p),
+            Kind::HangingMoss => self.hanging_moss_tick(state, p),
+            Kind::Lectern => self.lectern_tick(state, p), // G6-F01: end of the page pulse
+            Kind::GrowingHead { up } | Kind::GrowingBody { up } => self.growing_tick(state, p, up),
+            Kind::BigDripleaf => self.dripleaf_tick(state, p),
+            Kind::Speleothem { .. } => self.speleothem_tick(state, p), // G6-F09a
+            Kind::Test => self.test_block_tick(state, p),         // G6-F14: start block resets
+            // The water block's own tick (not its fluid tick) builds a bubble column.
+            Kind::Water => self.water_block_tick(state, p),
+            Kind::BubbleColumn => self.bubble_column_tick(state, p),
+            // Stem, chorus: broken (loot) if they no longer hold.
+            Kind::BigDripleafStem | Kind::ChorusFlower | Kind::ChorusPlant => {
+                if !self.can_survive(state, p) {
+                    self.destroy_block(p, true, 512);
+                }
+            }
+            Kind::Support(sup @ (Sup::CoralBelow { .. } | Sup::CoralWall { .. } | Sup::CoralBlock)) => {
+                self.coral_tick(sup, state, p);
+            }
+            _ if self.bz_egg_tick(state, p) => {}    // F10: frogspawn, sniffer egg
+            _ if self.cmdblock_tick(state, p) => {}  // S5: command blocks
+            _ if self.rec_block_tick(state, p) => {} // F14: heart, shrieker, dried ghast
+            _ if self.lightning_rod_tick(state, p) => {} // struck lightning rod that turns off
+            _ if self.catalyst_block_tick(state, p) => {} // end of a sculk catalyst's bloom
+            // Chests, barrels and Ender chests recount their openers.
+            _ if self.rechecks_openers_state(state) => self.recheck_container_openers(p),
+            _ => self.nature_tick(state, p),
+        }
+    }
+
+    pub(crate) fn random_tick(&mut self, state: u32, p: P) {
+        if self.pig_portal_random_tick(state, p) {
+            return; // F13: zombified piglins born from the portal
+        }
+        if self.rec_random_tick(state, p) {
+            return; // F14: dried ghast
+        }
+        self.nature_random_tick(state, p);
+    }
+
+    pub(crate) fn trigger_event(&mut self, state: u32, p: P, a: i32, b: i32) -> bool {
+        match self.view().kind(state) {
+            Kind::Piston { sticky } => self.piston_trigger(state, p, a, b, sticky),
+            // Bell: survey of nearby entities, shake (resonance at the next tick).
+            Kind::Bell => {
+                if a == 1 {
+                    self.bell_rung(p);
+                }
+                true
+            }
+            Kind::NoteBlock => self.note_sound(state, p),
+            Kind::Chest => true,
+            // G6-F09a: start of an eruption, timed by the client.
+            Kind::PotentSulfur => true,
+            // G6-F01: wobble of the decorated pot (style 0 or 1).
+            Kind::DecoratedPot => a == 1 && (0..2).contains(&b),
+            // Lid (opener count) of Ender chests, copper chests, Shulker boxes;
+            // the Shulker box also animates its lid on the server side.
+            _ if a == 1 => {
+                let Some(name) = self.data.block_of(state).map(|b| b.name.as_str()) else { return false };
+                if name.ends_with("shulker_box") {
+                    self.shulker_lid_event(p, b);
+                    return true;
+                }
+                name.ends_with("ender_chest") || name.ends_with("copper_chest")
+            }
+            _ => false,
+        }
+    }
+
+    /// Reaction of a block to a shape update: new state (air = destroyed).
+    pub(crate) fn update_shape(&mut self, state: u32, p: P, dir: Dir, np: P, ns: u32) -> u32 {
+        // Waterlogged blocks: water tick at each shape (except the water block itself).
+        let kind = self.view().kind(state);
+        if !matches!(kind, Kind::Water | Kind::Lava) && self.view().get_bool(state, PropKey::Waterlogged) {
+            self.schedule_fluid_tick(p, 1, 5);
+        }
+        if let Some(s) = self.portal_update_shape(state, p, dir, ns) {
+            return s; // S6: Nether portal
+        }
+        self.rec_update_shape(state, p); // F14: creaking heart
+        // Grass, podzol, mycelium: snowy according to the block above (tag `snow`).
+        if dir == Dir::Up && self.snowy_block(state) {
+            let snowy = self.view().block(ns);
+            let snowy =
+                self.block_tags.get("minecraft:snow").is_some_and(|t| t.binary_search(&u32::from(snowy)).is_ok());
+            return self.view().set_bool(state, PropKey::Snowy, snowy);
+        }
+        self.shape_of(state, kind, p, dir, np, ns)
+    }
+
+    /// "Snowable" block (grass, podzol, mycelium).
+    pub(crate) fn snowy_block(&self, s: u32) -> bool {
+        matches!(self.state_name(s), "minecraft:grass_block" | "minecraft:podzol" | "minecraft:mycelium")
+    }
+}
