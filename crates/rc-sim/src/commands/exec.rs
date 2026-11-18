@@ -1,0 +1,1443 @@
+//! Execution: chain of segments (`execute` subcommands then the final command), multiple
+//! sources (`as`, `at`…), conditions, result storage (`store`), data-pack
+//! functions (`function`, `schedule`, `return`), dispatch to the commands.
+
+use std::borrow::Cow;
+use std::collections::BTreeMap;
+use std::sync::Arc;
+
+use rc_proto::nbt::Nbt;
+
+use super::ents::E;
+use super::functions::{Function, ReadyLine};
+use super::paths::CommandPaths;
+use super::src::{Fail, Src, Store};
+use super::{Parsed, R, Seg, args, text};
+use crate::registries::Jar;
+use crate::server::Server;
+use crate::tr;
+
+pub use super::functions::compile_function;
+
+/// Function tags: name → members.
+pub type FunctionTags = BTreeMap<String, Arc<[String]>>;
+
+/// Functions and function tags of the stack of chosen packs
+/// (`data/<namespace>/function/**.mcfunction`, `data/<namespace>/tags/function`, `packs.rs`). Each
+/// function is compiled like the game does at load time (`compile_function`): one invalid line makes
+/// the whole of it refused (server log). The tags are then resolved against the
+/// loaded functions: nested tags flattened, refused as a whole if a required entry
+/// is missing or loops (`packs::resolve_tags`).
+pub(crate) fn load_functions(
+    jar: &Jar,
+    levels: &[super::Level],
+    cmd_data: &rc_commands::Data,
+    paths: &CommandPaths,
+) -> (BTreeMap<String, Function>, FunctionTags) {
+    let mut f = BTreeMap::new();
+    let mut shared = super::functions::SharedLines::default();
+    for (name, bytes) in &jar.files {
+        let Some(rest) = name.strip_prefix("data/") else { continue };
+        let Some((ns, path)) = rest.split_once('/') else { continue };
+        let Some(p) = path.strip_prefix("function/").and_then(|p| p.strip_suffix(".mcfunction")) else { continue };
+        let id = format!("{ns}:{p}");
+        let Ok(text) = std::str::from_utf8(bytes) else {
+            eprintln!("Failed to load function {id}: not UTF-8");
+            continue;
+        };
+        let raw: Vec<&str> = text.lines().collect();
+        match super::functions::compile_with(&raw, levels.get(2), cmd_data, paths, &mut shared) {
+            Ok(function) => {
+                f.insert(id, function);
+            }
+            Err(e) => eprintln!("Failed to load function {id}: {e}"),
+        }
+    }
+    let raw = crate::packs::raw_tags(jar, "function");
+    let map: BTreeMap<String, &[serde_json::Value]> =
+        raw.iter().map(|(n, v)| (n.clone(), v.as_array().map_or(&[][..], Vec::as_slice))).collect();
+    let tags = crate::packs::resolve_tags(&map, &|id| f.contains_key(id).then(|| id.to_owned()));
+    (f, tags.into_iter().map(|(name, members)| (name, Arc::from(members))).collect())
+}
+
+/// Functions designated by a `function` argument: one function, or the members of a tag
+/// (shared with the tag table, not copied at each call).
+pub(crate) enum FunctionIds {
+    One(String),
+    Tag(Arc<[String]>),
+}
+
+impl FunctionIds {
+    pub(super) fn as_slice(&self) -> &[String] {
+        match self {
+            FunctionIds::One(id) => std::slice::from_ref(id),
+            FunctionIds::Tag(ids) => ids,
+        }
+    }
+}
+
+/// Tags per registry (`minecraft:block` → name without `#` → members), like `Data::tags`: the
+/// member lists are shared with it.
+pub type TagSets = hashbrown::HashMap<String, rc_commands::data::RegistryTags>;
+
+/// Adds to the parsing tags those of the registries that `base` does not cover (tags of the
+/// synced and built-in registries, already resolved on the pack stack), read from the stack
+/// (`data/<ns>/tags/<registry>/…`), like the game which loads them before the functions: without them,
+/// a line citing `#pack:tag` would make the whole function refused. The members of these registries
+/// are not known here: only references between tags are checked.
+pub(crate) fn apply_pack_tags(jar: &Jar, data: &mut rc_commands::Data, base: &TagSets) {
+    // registry → tag → stacked values
+    let mut found: BTreeMap<String, Vec<(String, serde_json::Value)>> = BTreeMap::new();
+    for (name, bytes) in &jar.files {
+        let Some(rest) = name.strip_prefix("data/") else { continue };
+        let Some((ns, path)) = rest.split_once('/') else { continue };
+        let Some(full) = path.strip_prefix("tags/").and_then(|p| p.strip_suffix(".json")) else { continue };
+        // Registry folder: everything before the last level is not known in advance
+        // (`worldgen/biome`); the known registries are tested.
+        let Some((reg, tag)) = split_tag_path(data, base, full) else { continue };
+        if reg == "minecraft:function" || base.contains_key(&reg) {
+            continue;
+        }
+        let Ok(v) = serde_json::from_slice::<serde_json::Value>(bytes) else { continue };
+        let values = v.get("values").cloned().unwrap_or(serde_json::Value::Array(Vec::new()));
+        found.entry(reg).or_default().push((format!("{ns}:{tag}"), values));
+    }
+    for (reg, tags) in &found {
+        let map: BTreeMap<String, &[serde_json::Value]> =
+            tags.iter().map(|(n, v)| (n.clone(), v.as_array().map_or(&[][..], Vec::as_slice))).collect();
+        let resolved = crate::packs::resolve_tags(&map, &|id| Some(id.to_owned()));
+        data.set_tags(reg, resolved.into_iter().map(|(tag, members)| (tag, members.into())).collect());
+    }
+}
+
+/// Data registries of the `worldgen` folder neither synced nor known to the parser in advance:
+/// their tags (`tags/worldgen/feature/…`) are filed under their full name.
+const WORLDGEN_DATA_REGISTRIES: [&str; 15] = [
+    "worldgen/carver",
+    "worldgen/density_function",
+    "worldgen/feature",
+    "worldgen/flat_level_generator_preset",
+    "worldgen/material_condition",
+    "worldgen/material_rule",
+    "worldgen/multi_noise_biome_source_parameter_list",
+    "worldgen/noise",
+    "worldgen/noise_settings",
+    "worldgen/placed_feature",
+    "worldgen/processor_list",
+    "worldgen/structure",
+    "worldgen/structure_set",
+    "worldgen/template_pool",
+    "worldgen/world_preset",
+];
+
+/// Splits `block/foo/bar` into (registry `minecraft:block`, tag `foo/bar`): the registry is
+/// the longest folder prefix that is one (`worldgen/biome`), otherwise the first folder
+/// (data registry not known in advance, `villager_trade`), never `worldgen` alone, which is
+/// not a registry.
+fn split_tag_path(data: &rc_commands::Data, base: &TagSets, full: &str) -> Option<(String, String)> {
+    let parts: Vec<&str> = full.split('/').collect();
+    for n in (1..parts.len()).rev() {
+        let dir = parts[..n].join("/");
+        let reg = format!("minecraft:{dir}");
+        let known = data.has_registry(&reg) || base.contains_key(&reg) || WORLDGEN_DATA_REGISTRIES.contains(&dir.as_str());
+        if known || (n == 1 && dir != "worldgen") {
+            return Some((reg, parts[n..].join("/")));
+        }
+    }
+    None
+}
+
+/// Failure without a message (`return fail`, function call without a result).
+fn is_silent(c: &rc_text::Component) -> bool {
+    matches!(&c.content, rc_text::Content::Text(t) if t.is_empty()) && c.extra.is_empty()
+}
+
+/// An `execute` step (its words after `execute`) that reads or changes the world at a position
+/// rather than through an entity: it runs in the source's world.
+fn step_reads_the_world(words: &[&str]) -> bool {
+    matches!(
+        words,
+        ["if" | "unless", "block" | "blocks" | "biome" | "loaded" | "predicate", ..]
+            | ["if" | "unless", "data" | "items" | "slots", "block", ..]
+            | ["positioned", "over", ..]
+            | ["summon", ..]
+            | ["store", _, "block", ..]
+    )
+}
+
+/// The segment is a "fork" subcommand (multiple sources, errors silenced).
+fn is_fork(path: &str) -> bool {
+    path.starts_with("execute as ")
+        || path.starts_with("execute at ")
+        || path.starts_with("execute positioned as ")
+        || path.starts_with("execute rotated as ")
+        || path.starts_with("execute facing entity ")
+        || path.starts_with("execute if ")
+        || path.starts_with("execute unless ")
+        || path.starts_with("execute on ")
+}
+
+/// Execution context of a top-level command (input, command block, scheduled
+/// function…): like the game, a command quota (`max_command_sequence_length`) shared
+/// by everything it triggers (nested functions included) and a source limit
+/// (`max_command_forks`).
+#[derive(Debug, Clone, Default)]
+pub struct Flow {
+    pub active: bool,
+    /// Remaining cost: one subcommand step, one final command per source, one function
+    /// call. At 0, the whole execution stops (server log, no message).
+    pub quota: i64,
+    pub limit: i64,
+    pub fork_limit: i64,
+    /// The running final command follows a `return run` (a called function returns its
+    /// result to the calling function).
+    pub ret_mode: bool,
+    /// The final command returned no result (function without `return`): neither storage
+    /// (`store`) nor counted success.
+    pub no_callback: bool,
+    /// Function call depth: stack safeguard only (the game has just a queue).
+    pub depth: u32,
+}
+
+/// Depth of nested calls beyond which execution stops as with an exhausted quota
+/// (integrated server thread stack; the game, without recursion, only has the quota).
+pub const MAX_NESTING: u32 = 65536;
+
+#[cfg(test)]
+thread_local! {
+    /// Trials: (depth, address of a local variable) at each function call.
+    pub(crate) static STACK_PROBE: std::cell::RefCell<Vec<(u32, usize)>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+impl Server {
+    /// Runs `f` in the current execution context, or opens one (top level).
+    pub(crate) fn in_context<T>(&mut self, f: impl FnOnce(&mut Self) -> T) -> T {
+        if self.cmd.flow.active {
+            return f(self);
+        }
+        let int = |sv: &Self, k: &str| sv.rules.get(k).and_then(Nbt::as_i64).unwrap_or(65536);
+        let limit = int(self, "minecraft:max_command_sequence_length").max(1);
+        let forks = int(self, "minecraft:max_command_forks");
+        self.cmd.flow = Flow { active: true, quota: limit, limit, fork_limit: forks, ..Flow::default() };
+        let r = f(self);
+        if self.cmd.flow.quota <= 0 {
+            eprintln!("Command execution stopped due to limit (executed {} commands)", self.cmd.flow.limit);
+        }
+        self.cmd.flow = Flow::default();
+        self.cmd.returned = None;
+        r
+    }
+
+    /// Quota exhausted: nothing runs any more in this context.
+    pub(crate) fn exhausted(&self) -> bool {
+        self.cmd.flow.active && self.cmd.flow.quota <= 0
+    }
+
+    /// Runs a parsed input: subcommands then the final command for each source.
+    pub fn run_parsed(&mut self, src: &Src, p: &Parsed) -> (bool, i32) {
+        // A player hidden from the rest of a world's tick (it left that world, or stands in
+        // another one) is targeted, placed and moved by a command at its real place.
+        if self.player_is_hidden() {
+            return self.with_hidden_player_shown(|sv| sv.run_parsed(src, p));
+        }
+        let n = p.segs.len();
+        // `SHAREDSOURCE`: the caller's source is borrowed until a subcommand makes new ones; the
+        // former path copied it twice (the source list, the fork-limit message).
+        let copied_origin;
+        let origin = if self.cmd.paths.shared_source {
+            src
+        } else {
+            copied_origin = src.clone();
+            &copied_origin
+        };
+        let mut sources: Cow<'_, [Src]> =
+            if self.cmd.paths.shared_source { Cow::Borrowed(std::slice::from_ref(src)) } else { Cow::Owned(vec![src.clone()]) };
+        let mut forked = false;
+        // `return run`: the running function stops from this step, the rest returns its
+        // result (failure if no source remains).
+        let mut ret = false;
+        for seg in &p.segs[..n - 1] {
+            let path = seg.path_str();
+            if path == "return run" {
+                ret = true;
+                continue;
+            }
+            // Pure redirections (alias, `execute run`): no step, no cost.
+            if matches!(path, "tp" | "xp" | "tell" | "w" | "tm" | "execute run") {
+                continue;
+            }
+            forked |= is_fork(path);
+            if !path.ends_with(" function <name>") {
+                self.cmd.flow.quota -= 1;
+            }
+            let mut next = Vec::new();
+            // Split once for every source (the former loop split the path again per source).
+            let words: Vec<&str> = path.strip_prefix("execute ").unwrap_or(path).split(' ').collect();
+            for s in sources.iter() {
+                match self.run_step_in_its_world(s, p, seg, &words) {
+                    Ok(v) => {
+                        if self.cmd.flow.active && (next.len() + v.len()) as i64 >= self.cmd.flow.fork_limit {
+                            let limit = self.cmd.flow.fork_limit;
+                            self.fail_error(origin, tr!("command.forkLimit", limit), forked);
+                            if ret {
+                                self.cmd.returned = Some((false, 0));
+                            }
+                            return (false, 0);
+                        }
+                        next.extend(v);
+                    }
+                    Err(f) => {
+                        self.fail_error(s, f.0, forked);
+                        if !forked {
+                            // `return run` has already abandoned the function's frame: it
+                            // stops here, without running its following lines.
+                            if ret {
+                                self.cmd.returned = Some((false, 0));
+                            }
+                            return (false, 0);
+                        }
+                    }
+                }
+            }
+            sources = Cow::Owned(next);
+            if sources.is_empty() {
+                if ret {
+                    self.cmd.returned = Some((false, 0));
+                }
+                return (false, 0);
+            }
+        }
+        let last = &p.segs[n - 1];
+        let path = last.path_str();
+        // `function` and `return` run directly (no queue entry, no cost).
+        let custom = matches!(last.path.first().map(String::as_str), Some("function" | "return"));
+        // Return mode: only the first source runs the command.
+        let running = if ret && !custom { &sources[..sources.len().min(1)] } else { &sources[..] };
+        let mut any = false;
+        let mut total = 0i32;
+        for s in running {
+            if !custom {
+                if self.exhausted() {
+                    break;
+                }
+                self.cmd.flow.quota -= 1;
+            }
+            self.cmd.flow.ret_mode = ret;
+            self.cmd.flow.no_callback = false;
+            let r = self.command(s, p, last, path);
+            self.cmd.flow.ret_mode = false;
+            let no_callback = std::mem::take(&mut self.cmd.flow.no_callback);
+            let (ok, v) = match r {
+                Ok(v) => (true, v),
+                Err(f) => {
+                    if !is_silent(&f.0) {
+                        self.fail_error(s, f.0, forked);
+                    }
+                    (false, 0)
+                }
+            };
+            if ret && !custom {
+                self.cmd.returned = Some((ok, v));
+            }
+            // `return run function`: the first source that returns a result ends the
+            // calling function, the following ones never run.
+            let stop = ret && custom && self.cmd.returned.is_some();
+            if no_callback {
+                continue;
+            }
+            any |= ok;
+            self.cmd.successes += i32::from(ok);
+            total = total.wrapping_add(v);
+            self.apply_stores(s, ok, v);
+            if stop {
+                break;
+            }
+        }
+        (any, total)
+    }
+
+    fn apply_stores(&mut self, s: &Src, ok: bool, v: i32) {
+        for (result, st) in &s.stores {
+            let value = if *result { v } else { i32::from(ok) };
+            match st {
+                Store::Score { targets, objective } => {
+                    for t in targets {
+                        self.score_set(t, objective, value);
+                    }
+                }
+                Store::Bossbar { id, max } => {
+                    // `RUSTCRAFT_OPT_BOSSBARDIRTY`: the bars are saved again only if the store
+                    // changed a value (a store every tick of an unchanged value writes nothing).
+                    let mut changed = !self.cmd.paths.bossbar_dirty;
+                    if let Some(k) = self.cmd.bars.iter().position(|b| b.id == *id) {
+                        let b = &mut self.cmd.bars[k];
+                        changed |= (if *max { b.max } else { b.value }) != value;
+                        // To every player in game the bar shows to, only when its progress changed.
+                        if b.set_value_or_max(*max, value) {
+                            let progress = b.progress();
+                            self.bar_send(&self.cmd.bars[k], rc_proto_v777::play::BossOp::Progress(progress));
+                        }
+                    }
+                    self.cmd.bars_dirty |= changed;
+                }
+                Store::Block { world, pos, path, kind, scale } => {
+                    let tag = super::cmds_data::numeric(kind, f64::from(value) * scale);
+                    self.in_world(world, |sv| {
+                        if let Some(mut n) = sv.data_of_block(*pos)
+                            && super::cmds_data::path_set(&mut n, path, tag).is_ok()
+                        {
+                            sv.set_block_data(*pos, n);
+                        }
+                    });
+                }
+                Store::Entity { ent, path, kind, scale } => {
+                    if ent.is_player() {
+                        continue;
+                    }
+                    let tag = super::cmds_data::numeric(kind, f64::from(value) * scale);
+                    // Written where the entity lives, whatever world the command ran in.
+                    self.in_entity_world(*ent, |sv| {
+                        let mut n = sv.ent_nbt(*ent);
+                        if super::cmds_data::path_set(&mut n, path, tag).is_ok() {
+                            sv.ent_set_nbt(*ent, &n);
+                        }
+                    });
+                }
+                Store::Storage { id, path, kind, scale } => {
+                    let tag = super::cmds_data::numeric(kind, f64::from(value) * scale);
+                    if self.cmd.paths.data_borrow {
+                        // Set in the stored compound itself: any set that finds its place counts
+                        // as written (saved), a failed one keeps what it created.
+                        let set = |n: &mut Nbt| super::cmds_data::path_set(n, path, tag).map(|_| 1);
+                        let _ = self.storage_edit_in_place(id, set);
+                        continue;
+                    }
+                    let mut n = self.cmd.storage.get(id).cloned().unwrap_or(Nbt::Compound(Vec::new()));
+                    if super::cmds_data::path_set(&mut n, path, tag).is_ok() {
+                        self.storage_put(id, n);
+                    } else if let Some(stored) = self.cmd.storage.get_mut(id) {
+                        // The game sets into the stored compound itself: a failed store keeps
+                        // what it created (unsaved until the namespace is written again).
+                        *stored = n;
+                    }
+                }
+            }
+        }
+        self.flush_scores();
+    }
+
+    /// [`Self::modifier`] for source `s`, like the game: a step reading or changing the world at a
+    /// position runs in the source's world, and the entities its arguments name are found and
+    /// read where they live (`entity_worlds.rs`) whatever world the step runs in.
+    fn run_step_in_its_world(&mut self, s: &Src, p: &Parsed, seg: &Seg, words: &[&str]) -> Result<Vec<Src>, Fail> {
+        if s.dim == self.dim.name || !step_reads_the_world(words) {
+            return self.modifier(s, p, seg, words);
+        }
+        let world = s.dim.clone();
+        self.in_world(&world, |sv| sv.modifier(s, p, seg, words))
+    }
+
+    /// The world entity `e`, found in the world the server works in, stands in: a player stands
+    /// in its own world (the one its client shows) even while the server works in another one.
+    fn world_of_found(&self, e: E) -> &str {
+        match e {
+            E::Player => &self.client_world,
+            E::OtherPlayer(id) => self.other_player(id).map_or(&self.dim.name, |c| &c.client_world),
+            _ => &self.dim.name,
+        }
+    }
+
+    /// Subcommand (redirection): following sources. `words`: the segment's path without its
+    /// `execute` root, split on spaces (aliases and `execute run` never come here: `run_parsed`
+    /// skips them).
+    fn modifier(&mut self, s: &Src, p: &Parsed, seg: &Seg, words: &[&str]) -> Result<Vec<Src>, Fail> {
+        let a = |n: &str| p.arg(seg, n).unwrap_or_default();
+        let one = |x: Src| Ok(vec![x]);
+        // Entity arguments are searched like the game's (every world unless limited to the
+        // source's) and each entity found is read in the world holding it.
+        match words {
+            ["as", _] => {
+                let found = self.step_entities(s, &a("targets"));
+                Ok(self.read_found(&found, |sv, e| sv.with_entity(s, e)))
+            }
+            ["at", _] => {
+                let targets = a("targets");
+                if targets == "@s"
+                    && let Some((pos, rot, world)) = self.own_place_elsewhere(s)
+                {
+                    return one(Src { pos, rot, dim: world, ..s.clone() });
+                }
+                let found = self.step_entities(s, &targets);
+                Ok(self.read_found(&found, |sv, e| {
+                    let mut x = s.clone();
+                    x.pos = sv.e_pos(e);
+                    let [y, pi] = sv.ent_rot(e);
+                    x.rot = [pi, y];
+                    // The entity's world too, like the game.
+                    let world = sv.world_of_found(e);
+                    if x.dim != world {
+                        world.clone_into(&mut x.dim);
+                    }
+                    x
+                }))
+            }
+            ["positioned", "<pos>"] => {
+                let mut x = s.clone();
+                x.pos = args::vec3(self, s, &a("pos"));
+                x.eyes = false;
+                one(x)
+            }
+            ["positioned", "as", _] => {
+                let found = self.step_entities(s, &a("targets"));
+                Ok(self.read_found(&found, |sv, e| {
+                    let mut x = s.clone();
+                    x.pos = sv.e_pos(e);
+                    x
+                }))
+            }
+            ["positioned", "over", _] => {
+                let (bx, bz) = (s.pos[0].floor() as i32, s.pos[2].floor() as i32);
+                if !self.is_loaded([bx, 0, bz]) {
+                    return Err(Fail(tr!("argument.pos.unloaded")));
+                }
+                let h = self.surface_height(&a("heightmap"), bx, bz);
+                let mut x = s.clone();
+                x.pos[1] = f64::from(h);
+                one(x)
+            }
+            ["rotated", "<rot>"] => {
+                let mut x = s.clone();
+                let [y, pi] = args::rotation(s, &a("rot"));
+                x.rot = [pi, y];
+                one(x)
+            }
+            ["rotated", "as", _] => {
+                let found = self.step_entities(s, &a("targets"));
+                Ok(self.read_found(&found, |sv, e| {
+                    let mut x = s.clone();
+                    let [y, pi] = sv.ent_rot(e);
+                    x.rot = [pi, y];
+                    x
+                }))
+            }
+            ["facing", "entity", _, _] => {
+                let eyes = a("anchor") == "eyes";
+                let found = self.step_entities(s, &a("targets"));
+                let targets = self.read_found(&found, |sv, e| {
+                    let mut t = sv.e_pos(e);
+                    if eyes {
+                        t[1] += sv.ent_eye_height(e);
+                    }
+                    t
+                });
+                let from = self.source_anchor(s);
+                Ok(targets.into_iter().map(|t| self.facing_from(s, from, t)).collect())
+            }
+            ["facing", "<pos>"] => {
+                let t = args::vec3(self, s, &a("pos"));
+                let from = self.source_anchor(s);
+                one(self.facing_from(s, from, t))
+            }
+            ["align", _] => {
+                let mut x = s.clone();
+                for c in a("axes").chars() {
+                    let k = match c {
+                        'x' => 0,
+                        'y' => 1,
+                        _ => 2,
+                    };
+                    x.pos[k] = x.pos[k].floor();
+                }
+                one(x)
+            }
+            ["anchored", _] => {
+                let mut x = s.clone();
+                x.eyes = a("anchor") == "eyes";
+                one(x)
+            }
+            ["in", _] => {
+                let d = args::id(&a("dimension"));
+                if !self.world_dimensions().contains(&d) {
+                    return Err(Fail(tr!("argument.dimension.invalid", d)));
+                }
+                // Interface S6: without parked worlds, only the open dimension exists; the
+                // source changes dimension (coordinates unchanged, like the game).
+                let mut x = s.clone();
+                x.dim = d;
+                one(x)
+            }
+            ["summon", _] => {
+                let e = self.summon_entity(s, &args::id(&a("entity")), s.pos, None)?;
+                one(self.with_entity(s, e))
+            }
+            ["on", relation] => {
+                let Some(me) = s.entity else { return Ok(Vec::new()) };
+                // Read where the source's entity lives, with the entities related to it.
+                Ok(self.in_entity_world(me, |sv| sv.related_sources(s, me, relation)))
+            }
+            ["store", kind @ ("result" | "success"), rest @ ..] => {
+                let result = *kind == "result";
+                let st = match rest {
+                    ["score", _, _] => {
+                        let targets = self.step_score_holders(s, &a("targets"))?;
+                        let objective = a("objective");
+                        if self.cmd.scores.objective(&objective).is_none() {
+                            return Err(Fail(tr!("arguments.objective.notFound", objective)));
+                        }
+                        Store::Score { targets, objective }
+                    }
+                    // Targets checked as soon as redirected, like the game: unknown bar or block
+                    // without a block entity stop the command.
+                    ["bossbar", _, which] => {
+                        let id = args::id(&a("id"));
+                        self.bar(&id)?;
+                        Store::Bossbar { id, max: *which == "max" }
+                    }
+                    ["block", _, _, ty, _] => {
+                        let pos = self.loaded_pos(s, &a("target"))?;
+                        if self.be_get(pos).is_none() {
+                            return Err(Fail(tr!("commands.data.block.invalid")));
+                        }
+                        Store::Block {
+                            world: self.dim.name.clone(),
+                            pos,
+                            path: a("path"),
+                            kind: (*ty).to_owned(),
+                            scale: a("scale").parse().unwrap_or(1.0),
+                        }
+                    }
+                    ["entity", _, _, ty, _] => {
+                        // Found in any world; written where it lives (`apply_stores`).
+                        let found = self.step_entity(s, &a("target"))?;
+                        let Some(ent) = found.first() else { return Err(Fail(tr!("argument.entity.notfound.entity"))) };
+                        Store::Entity { ent, path: a("path"), kind: (*ty).to_owned(), scale: a("scale").parse().unwrap_or(1.0) }
+                    }
+                    ["storage", _, _, ty, _] => Store::Storage {
+                        id: args::id(&a("target")),
+                        path: a("path"),
+                        kind: (*ty).to_owned(),
+                        scale: a("scale").parse().unwrap_or(1.0),
+                    },
+                    _ => return Err(Fail(tr!("command.failed"))),
+                };
+                let mut x = s.clone();
+                x.stores.push((result, st));
+                one(x)
+            }
+            [cond @ ("if" | "unless"), "function", _] => {
+                // The game queues nothing for a name that designates no function (a tag unknown
+                // or empty): the chain stops there, for `unless` as for `if`.
+                let Some(value) = self.call_functions(s, &a("name"))? else { return Ok(Vec::new()) };
+                Ok(if (value != 0) == (*cond == "if") { vec![s.clone()] } else { Vec::new() })
+            }
+            [cond @ ("if" | "unless"), rest @ ..] => {
+                let expected = *cond == "if";
+                let n = self.condition(s, p, seg, rest, false)?;
+                Ok(if (n > 0) == expected { vec![s.clone()] } else { Vec::new() })
+            }
+            _ => Err(Fail(tr!("command.unknown.command"))),
+        }
+    }
+
+    /// `execute on <relation>`: a source for each entity related to `me`, read in the world the
+    /// server works in (the one holding `me`).
+    fn related_sources(&self, s: &Src, me: E, relation: &str) -> Vec<Src> {
+        let found: Vec<E> = match relation {
+            "attacker" => self.relation_attacker(me).into_iter().collect(),
+            "target" => self.relation_target(me).into_iter().collect(),
+            "owner" => self.relation_owner(me).into_iter().collect(),
+            "vehicle" => self.vehicle_of(me).into_iter().collect(),
+            "passengers" => self.relation_passengers(me),
+            "controller" => self.relation_controller(me).into_iter().collect(),
+            "origin" => self.relation_origin(me).into_iter().collect(),
+            "leasher" => self.relation_leasher(me).into_iter().collect(),
+            _ => Vec::new(),
+        };
+        found.into_iter().map(|e| self.with_entity(s, e)).collect()
+    }
+
+    /// `execute on passengers`: direct passengers, in order.
+    fn relation_passengers(&self, e: E) -> Vec<E> {
+        // G5-F06: passengers of a minecart.
+        if let E::Other(i) = e
+            && let Some(c) = self.cart_ref(i)
+        {
+            return c.passengers.iter().map(|&p| self.passenger_entity(p)).collect();
+        }
+        let E::Mob(i) = e else { return Vec::new() };
+        let Some(m) = self.mobs.mob_ref_any(i) else { return Vec::new() };
+        m.mount.passengers.iter().map(|&p| self.passenger_entity(p)).collect()
+    }
+
+    /// `execute on controller`: the passenger that steers (player on a saddled mount, mob
+    /// leading a mount without its AI turned off).
+    fn relation_controller(&self, e: E) -> Option<E> {
+        let E::Mob(i) = e else { return None };
+        let m = self.mobs.mob_ref_any(i)?;
+        // The steering player is the first passenger, whichever player that is.
+        if Self::player_controls(m) {
+            return m.mount.passengers.first().map(|&p| self.passenger_entity(p));
+        }
+        Self::mob_controller(m).map(E::Mob)
+    }
+
+    /// `execute on origin`: thrower of a thrown item, summoner of a vex, registered
+    /// owner (`Owner`) of a projectile, a cloud or a TNT.
+    fn relation_origin(&self, e: E) -> Option<E> {
+        use crate::mobs::mob::Ent;
+        match e {
+            E::Item(i) => match self.life.drops.iter().find(|d| d.id == i)?.thrower? {
+                Ent::Player => Some(E::Player),
+                Ent::Mob(x) => Some(E::Mob(x)).filter(|m| self.ent_exists(*m)),
+            },
+            E::Mob(i) => {
+                let m = self.mobs.mob_ref_any(i)?;
+                self.ent_by_uuid(m.ill.owner?)
+            }
+            E::Other(_) => {
+                let n = self.ent_nbt(e);
+                self.ent_by_uuid(crate::nbtio::uuid(n.get("Owner"))?)
+            }
+            _ => None,
+        }
+    }
+
+    /// The source's anchor: its position, raised to its entity's eyes (`anchored eyes`) read in
+    /// the world holding that entity.
+    fn source_anchor(&mut self, s: &Src) -> [f64; 3] {
+        match s.entity {
+            Some(e) if s.eyes => self.in_entity_world(e, |sv| s.anchor(sv)),
+            _ => s.pos,
+        }
+    }
+
+    /// Source `s` turned from its anchor `from` towards `t`.
+    pub(crate) fn facing_from(&self, s: &Src, from: [f64; 3], t: [f64; 3]) -> Src {
+        let (dx, dy, dz) = (t[0] - from[0], t[1] - from[1], t[2] - from[2]);
+        let sd = (dx * dx + dz * dz).sqrt();
+        // Like the game: fast arctangent (table), π rounded to a 32-bit float, removal of the
+        // 90° done in 32 bits.
+        use crate::mobs::mth::{atan2, wrap};
+        let pi = f64::from(std::f32::consts::PI);
+        let pitch = wrap((-(atan2(dy, sd) * 180.0 / pi)) as f32);
+        let yaw = wrap((atan2(dz, dx) * 180.0 / pi) as f32 - 90.0);
+        let mut x = s.clone();
+        x.rot = [pitch, yaw];
+        x
+    }
+
+    fn surface_height(&self, map: &str, x: i32, z: i32) -> i32 {
+        let kind = match map {
+            "world_surface" => 1,
+            "ocean_floor" => 3,
+            "motion_blocking" => 4,
+            _ => 5,
+        };
+        self.surface_y(x, z, kind)
+    }
+
+    /// Condition of `execute if|unless`: number of matches (0 = false). `counted`: the terminal
+    /// form, whose message gives the count; before another step only "none or some" matters.
+    fn condition(&mut self, s: &Src, p: &Parsed, seg: &Seg, rest: &[&str], counted: bool) -> Result<i32, Fail> {
+        let a = |n: &str| p.arg(seg, n).unwrap_or_default();
+        Ok(match rest {
+            ["entity", _] if !counted => i32::from(self.step_finds_any(s, &a("entities"))),
+            ["block", _, _] => {
+                let pos = self.loaded_pos(s, &a("pos"))?;
+                i32::from(self.block_matches(&a("block"), pos))
+            }
+            ["blocks", _, _, _, mode] => {
+                let start = self.loaded_pos(s, &a("start"))?;
+                let end = self.loaded_pos(s, &a("end"))?;
+                let dest = self.loaded_pos(s, &a("destination"))?;
+                self.compare_regions(start, end, dest, *mode == "masked")?.unwrap_or(0)
+            }
+            ["entity", _] => self.step_entities(s, &a("entities")).len() as i32,
+            ["score", _, _, op, _, _] => {
+                // Each side read where its entities live (`@s` in one world, the other side's
+                // selector in another).
+                let t = self.step_score_holders(s, &a("target"))?;
+                let src2 = self.step_score_holders(s, &a("source"))?;
+                let to = a("targetObjective");
+                let so = a("sourceObjective");
+                for o in [&to, &so] {
+                    if self.cmd.scores.objective(o).is_none() {
+                        return Err(Fail(tr!("arguments.objective.notFound", o)));
+                    }
+                }
+                let (Some(x), Some(y)) = (self.cmd.scores.get(&t[0], &to), self.cmd.scores.get(&src2[0], &so)) else {
+                    return Ok(0);
+                };
+                i32::from(match *op {
+                    "=" => x == y,
+                    "<" => x < y,
+                    "<=" => x <= y,
+                    ">" => x > y,
+                    _ => x >= y,
+                })
+            }
+            ["score", _, _, "matches", _] => {
+                let t = self.step_score_holders(s, &a("target"))?;
+                let to = a("targetObjective");
+                if self.cmd.scores.objective(&to).is_none() {
+                    return Err(Fail(tr!("arguments.objective.notFound", to)));
+                }
+                let r = super::select::read_range(&a("range")).unwrap_or_default();
+                self.cmd.scores.get(&t[0], &to).map_or(0, |v| i32::from(r.test(f64::from(v))))
+            }
+            ["data", "entity", _, _] => {
+                // The entity's data read where it lives.
+                let found = self.step_entity(s, &a("source"))?;
+                let path = a("path");
+                let counts =
+                    self.read_found(&found, |sv, e| super::cmds_data::path_count(&sv.readable_entity_data(e), &path));
+                counts.first().copied().unwrap_or(0) as i32
+            }
+            ["data", kind, _, _] => {
+                let n = self.data_source(s, p, seg, kind)?;
+                super::cmds_data::path_count(&n, &a("path")) as i32
+            }
+            ["dimension", _] => i32::from(args::id(&a("dimension")) == s.dim),
+            ["loaded", _] => {
+                let pos = args::block_pos(self, s, &a("pos"));
+                i32::from(self.is_loaded(pos))
+            }
+            ["biome", _, _] => {
+                let pos = self.loaded_pos(s, &a("pos"))?;
+                let b = self.biome_name(pos);
+                let want = a("biome");
+                i32::from(match want.strip_prefix('#') {
+                    Some(t) => self.biome_tag(pos, &args::id(t)),
+                    None => args::id(&want) == b,
+                })
+            }
+            ["function", _] => i32::from(self.call_functions(s, &a("name"))?.is_some_and(|value| value != 0)),
+            ["predicate", _] => i32::from(self.command_predicate(s, &a("predicate"))?), // S9
+            ["items", ..] => self.count_items(s, p, seg)?,
+            // Number of slots the target owns in the range (empty ones included).
+            ["slots", ..] => self.count_slots(s, p, seg)?,
+            // Elapsed time of the stopwatch, in seconds, in the range.
+            ["stopwatch", _, _] => {
+                let id = args::id(&a("id"));
+                let Some(secs) = self.stopwatch_seconds(&id) else {
+                    return Err(Fail(tr!("commands.stopwatch.does_not_exist", id)));
+                };
+                let r = super::select::read_range(&a("range")).unwrap_or_default();
+                i32::from(r.test(secs))
+            }
+            _ => 0,
+        })
+    }
+
+    /// Loaded position.
+    pub fn loaded_pos(&self, s: &Src, text: &str) -> Result<[i32; 3], Fail> {
+        let pos = args::block_pos(self, s, text);
+        if !self.is_loaded(pos) {
+            return Err(Fail(tr!("argument.pos.unloaded")));
+        }
+        if !self.in_build_height(pos[1]) {
+            return Err(Fail(tr!("argument.pos.outofworld")));
+        }
+        Ok(pos)
+    }
+
+    fn compare_regions(&self, a: [i32; 3], b: [i32; 3], d: [i32; 3], masked: bool) -> Result<Option<i32>, Fail> {
+        let min = [a[0].min(b[0]), a[1].min(b[1]), a[2].min(b[2])];
+        let max = [a[0].max(b[0]), a[1].max(b[1]), a[2].max(b[2])];
+        let area = (0..3).map(|k| i64::from(max[k] - min[k] + 1)).product::<i64>();
+        if area > 32768 {
+            return Err(Fail(tr!("commands.execute.blocks.toobig", 32768, area)));
+        }
+        let air = self.table().block_id("air");
+        let mut count = 0;
+        for z in min[2]..=max[2] {
+            for y in min[1]..=max[1] {
+                for x in min[0]..=max[0] {
+                    let sp = [x, y, z];
+                    let dp = [d[0] + x - min[0], d[1] + y - min[1], d[2] + z - min[2]];
+                    let st = self.get(sp);
+                    if masked && self.view().block(st) == air {
+                        continue;
+                    }
+                    if st != self.get(dp) {
+                        return Ok(None);
+                    }
+                    let strip = |n: Option<Nbt>| {
+                        n.map(|mut n| {
+                            for k in ["x", "y", "z", "id"] {
+                                crate::nbtio::remove(&mut n, k);
+                            }
+                            n
+                        })
+                    };
+                    // The live data: a furnace's NBT lags until the save. The destination's is
+                    // only read when the source has data to compare it with.
+                    let sb = strip(self.live_block_data(sp));
+                    let compared = sb.is_some() || !self.cmd.paths.data_borrow;
+                    let db = if compared { strip(self.live_block_data(dp)) } else { None };
+                    if let Some(sb) = sb {
+                        match db {
+                            Some(db) if crate::items::nbt_eq(&sb, &db) => {}
+                            _ => return Ok(None),
+                        }
+                    }
+                    count += 1;
+                }
+            }
+        }
+        Ok(Some(count))
+    }
+
+    /// Final command.
+    fn command(&mut self, s: &Src, p: &Parsed, seg: &Seg, path: &str) -> R {
+        // `execute in`: the command runs in the source's world (S6); `teleport` does the
+        // dimension change itself; a final condition runs where a step would (its entity
+        // arguments are found where they live).
+        let head = seg.path.first().map(String::as_str);
+        if s.dim != self.dim.name && head != Some("teleport") {
+            let in_source_world = head != Some("execute") || {
+                let words: Vec<&str> = path.split(' ').skip(1).collect();
+                step_reads_the_world(&words)
+            };
+            if in_source_world {
+                let world = s.dim.clone();
+                return self.in_dimension(&world, |sv| sv.command_here(s, p, seg, path));
+            }
+        }
+        self.command_here(s, p, seg, path)
+    }
+
+    fn command_here(&mut self, s: &Src, p: &Parsed, seg: &Seg, path: &str) -> R {
+        let head = seg.path.first().map(String::as_str).unwrap_or("");
+        match head {
+            "execute" => {
+                // Terminal condition (`execute if … ` without `run`).
+                let w: Vec<&str> = path.split(' ').skip(1).collect();
+                let expected = w.first() == Some(&"if");
+                let numeric = matches!(w.get(1), Some(&"entity" | &"data" | &"items" | &"slots" | &"blocks"));
+                let n = self.condition(s, p, seg, &w[1..], true)?;
+                if numeric {
+                    if expected {
+                        if n > 0 {
+                            self.ok(s, tr!("commands.execute.conditional.pass_count", n));
+                            return Ok(n);
+                        }
+                        return Err(Fail(tr!("commands.execute.conditional.fail")));
+                    }
+                    if n == 0 {
+                        self.ok(s, tr!("commands.execute.conditional.pass"));
+                        return Ok(1);
+                    }
+                    return Err(Fail(tr!("commands.execute.conditional.fail_count", n)));
+                }
+                if (n > 0) == expected {
+                    self.ok(s, tr!("commands.execute.conditional.pass"));
+                    Ok(1)
+                } else {
+                    Err(Fail(tr!("commands.execute.conditional.fail")))
+                }
+            }
+            "function" => self.cmd_function(s, p, seg),
+            "return" => {
+                if seg.path.get(1).map(String::as_str) == Some("fail") {
+                    // Failure without a message; the function stops.
+                    self.cmd.returned = Some((false, 0));
+                    return Err(Fail(rc_text::Component::text("")));
+                }
+                let v = p.arg(seg, "value").and_then(|v| v.parse().ok()).unwrap_or(0);
+                self.cmd.returned = Some((true, v));
+                Ok(v)
+            }
+            "schedule" => self.cmd_schedule(s, p, seg),
+            _ => self.dispatch(s, p, seg, path),
+        }
+    }
+
+    /// Runs a function or a function tag (`execute if function`): the first one that returns a
+    /// result stops the following ones. The value returned (0 without `return`), or `None` when
+    /// `name` designates no function (a tag unknown or empty).
+    pub fn call_functions(&mut self, s: &Src, name: &str) -> Result<Option<i32>, Fail> {
+        let ids = self.function_ids(name)?;
+        if ids.as_slice().is_empty() {
+            return Ok(None);
+        }
+        let mut fs = s.clone();
+        fs.stores.clear();
+        for id in ids.as_slice() {
+            let lines = match self.instantiate_function(id, None) {
+                Ok(l) => l,
+                Err(f) => return Err(Fail(tr!("commands.execute.function.instantiationFailure", id.clone(), f.0))),
+            };
+            if let Some((_, v)) = self.call_function(&fs, id, &lines) {
+                return Ok(Some(v));
+            }
+            if self.exhausted() {
+                break;
+            }
+        }
+        Ok(Some(0))
+    }
+
+    /// Functions launched by the server (`tick`/`load` tags, `schedule`, advancement
+    /// rewards, `/debug function`): each in its own execution context, like the game;
+    /// (found, last value returned).
+    pub fn run_functions(&mut self, s: &Src, name: &str, _announce: bool) -> Result<(bool, i32), Fail> {
+        let ids = self.function_ids(name)?;
+        let last = self.run_function_ids(s, &ids);
+        Ok((!ids.as_slice().is_empty(), last))
+    }
+
+    /// `run_functions` of functions already designated; last value returned.
+    pub(crate) fn run_function_ids(&mut self, s: &Src, ids: &FunctionIds) -> i32 {
+        let mut last = 0;
+        for id in ids.as_slice() {
+            let Ok(lines) = self.instantiate_function(id, None) else { continue };
+            if let Some((_, v)) = self.in_context(|sv| sv.call_function(s, id, &lines)) {
+                last = v;
+            }
+        }
+        last
+    }
+
+    /// Ids designated by `name` (`#tag` or function). A tag nobody defined holds no function, like
+    /// the game's tag lookup with an empty list as default; only an unknown function is refused.
+    pub(super) fn function_ids(&self, name: &str) -> Result<FunctionIds, Fail> {
+        if let Some(t) = name.strip_prefix('#') {
+            let t = args::id(t);
+            return Ok(match self.cmd.function_tags.get(&t) {
+                Some(v) if self.cmd.paths.function_cache => FunctionIds::Tag(v.clone()),
+                // Former path: the member list copied at each call.
+                Some(v) => FunctionIds::Tag(Arc::from(v.to_vec())),
+                None => FunctionIds::Tag(Arc::from(Vec::new())),
+            });
+        }
+        let id = args::id(name);
+        if !self.cmd.functions.contains_key(&id) {
+            return Err(Fail(tr!("arguments.function.unknown", id)));
+        }
+        Ok(FunctionIds::One(id))
+    }
+
+    /// Lines to run of a function: its own lines (plain function), or macros substituted
+    /// (`$…$(key)…`) then parsed, like the game's instantiation; error = reason
+    /// (`commands.function.error.*`).
+    fn instantiate_function(&mut self, id: &str, args_nbt: Option<&Nbt>) -> Result<Arc<[ReadyLine]>, Fail> {
+        let paths = self.cmd.paths;
+        let cmd = &mut self.cmd;
+        let Some(f) = cmd.functions.get_mut(id) else { return Ok(Arc::from(Vec::new())) };
+        if !f.is_macro() {
+            return Ok(f.plain_lines(&paths));
+        }
+        let Some(args_nbt) = args_nbt else {
+            return Err(Fail(tr!("commands.function.error.missing_arguments", id.to_owned())));
+        };
+        // Values in parameter order (the game reports the first parameter missing).
+        let mut values = Vec::with_capacity(f.params.len());
+        for k in &f.params {
+            let Some(v) = args_nbt.get(k) else {
+                return Err(Fail(tr!("commands.function.error.missing_argument", id.to_owned(), k.clone())));
+            };
+            values.push(macro_string(v));
+        }
+        // `MACROCACHE`: the same values give the same lines (a parse depends on the text and the
+        // pack data only, and a reload builds new functions).
+        if paths.macro_cache
+            && let Some(kept) = f.kept_instance(&values)
+        {
+            return Ok(kept);
+        }
+        match f.instantiate(&values, cmd.levels.get(2), &cmd.data, &paths) {
+            Ok(lines) => {
+                if paths.macro_cache {
+                    f.keep_instance(values, lines.clone());
+                }
+                Ok(lines)
+            }
+            Err((command, msg)) => Err(Fail(tr!("commands.function.error.parse", id.to_owned(), command, msg))),
+        }
+    }
+
+    /// Call of an instantiated function (queue entry of the game: one cost); `Some((success,
+    /// value))` if it returned a result (`return`).
+    fn call_function(&mut self, s: &Src, id: &str, lines: &[ReadyLine]) -> Option<(bool, i32)> {
+        if !self.cmd.flow.active {
+            // Top-level call: its own context (the lines must not each
+            // open one, which would reset the call state to zero).
+            return self.in_context(|sv| sv.call_function(s, id, lines));
+        }
+        if self.exhausted() {
+            return None;
+        }
+        self.cmd.flow.quota -= 1;
+        if self.cmd.flow.depth >= MAX_NESTING {
+            // Stack safeguard: complete stop, like an exhausted quota.
+            self.cmd.flow.quota = 0;
+            return None;
+        }
+        if super::cmds_ents::tracing() {
+            // `/debug function`: traced call with the function's command count.
+            super::cmds_ents::trace_call(self.cmd.depth as usize, id, lines.len());
+        }
+        #[cfg(test)]
+        {
+            let here = 0u8;
+            let a = std::ptr::from_ref(&here) as usize;
+            STACK_PROBE.with(|p| p.borrow_mut().push((self.cmd.flow.depth, a)));
+        }
+        self.cmd.depth += 1;
+        self.cmd.flow.depth += 1;
+        let mut fs = s.clone();
+        fs.silent = true;
+        fs.level = fs.level.max(2);
+        fs.stores.clear();
+        let saved = self.cmd.returned.take();
+        // The lines of a function are no typed command: their messages carry no player sender.
+        let typed_by_player = self.cmd.typed_by_player.take();
+        for l in lines {
+            if self.exhausted() {
+                break;
+            }
+            super::cmds_ents::trace_command(self.cmd.depth as usize, &l.text);
+            let (ok, v) = self.run_function_line(&fs, l);
+            if ok {
+                super::cmds_ents::trace_return(self.cmd.depth as usize, &l.text, v);
+            }
+            if self.cmd.returned.is_some() {
+                break;
+            }
+        }
+        self.cmd.typed_by_player = typed_by_player;
+        let result = std::mem::replace(&mut self.cmd.returned, saved);
+        self.cmd.depth -= 1;
+        self.cmd.flow.depth -= 1;
+        result
+    }
+
+    /// One line of a function: its kept parse runs as is (level 2, like the game's compiled
+    /// functions; made at the line's first run), otherwise its text is parsed now at the
+    /// source's level.
+    fn run_function_line(&mut self, fs: &Src, line: &ReadyLine) -> (bool, i32) {
+        // Former path: each line got its own copy of the source.
+        let copied;
+        let src = if self.cmd.paths.shared_source {
+            fs
+        } else {
+            copied = fs.clone();
+            &copied
+        };
+        let kept = line.parsed.as_ref().and_then(|cell| match cell.get() {
+            Some(p) => Some(p),
+            None => self.first_parse(&line.text).map(|p| cell.get_or_init(|| p)),
+        });
+        match kept {
+            Some(parsed) => self.run_kept_parse(src, parsed),
+            None => self.perform_as(src, &line.text),
+        }
+    }
+
+    /// Level-2 parse of a function line checked at load, made at its first run. `None` (the
+    /// line then runs by text) only if the packs changed without reloading the functions, which
+    /// never happens: both reload together.
+    fn first_parse(&self, text: &str) -> Option<Arc<Parsed>> {
+        let lvl = self.cmd.levels.get(2)?;
+        super::parse_function_line(lvl, &self.cmd.data, text, self.cmd.paths.parser_no_alloc).ok().map(Arc::new)
+    }
+
+    /// `perform` of a command parsed beforehand.
+    fn run_kept_parse(&mut self, src: &Src, parsed: &Parsed) -> (bool, i32) {
+        super::cmds_ents::SERVER_LANG.get_or_init(|| crate::stations::en_us(&self.life.items));
+        if self.exhausted() {
+            return (false, 0);
+        }
+        self.in_context(|sv| sv.run_parsed(src, parsed))
+    }
+
+    /// Command `function <name> [arguments | with …]`.
+    fn cmd_function(&mut self, s: &Src, p: &Parsed, seg: &Seg) -> R {
+        let ret = std::mem::take(&mut self.cmd.flow.ret_mode);
+        let name = p.arg(seg, "name").unwrap_or_default();
+        let designated = self.function_ids(&name)?;
+        let ids = designated.as_slice();
+        if ids.is_empty() {
+            return Err(Fail(tr!("commands.function.scheduled.no_functions", args::id(name.trim_start_matches('#')))));
+        }
+        let fargs = self.function_arguments(s, p, seg)?;
+        if ids.len() == 1 {
+            self.ok(s, tr!("commands.function.scheduled.single", ids[0].clone()));
+        } else {
+            let list = text::list(ids.iter().map(|i| rc_text::Component::text(i.clone())).collect());
+            self.ok(s, tr!("commands.function.scheduled.multiple", list));
+        }
+        let single = ids.len() == 1;
+        let mut got: Option<(bool, i32)> = None;
+        let mut sum = 0i32;
+        for id in ids {
+            let lines = match self.instantiate_function(id, fargs.as_ref()) {
+                Ok(l) => l,
+                Err(f) => {
+                    if ret {
+                        self.cmd.returned = Some((false, 0));
+                    }
+                    return Err(Fail(tr!("commands.function.instantiationFailure", id.clone(), f.0)));
+                }
+            };
+            let r = self.call_function(s, id, &lines);
+            if let Some((ok, v)) = r {
+                // Result announced to the source (nothing if it is muted).
+                self.ok(s, tr!("commands.function.result", id.clone(), v));
+                if ret {
+                    // `return run function`: the first function that returns a result returns it
+                    // to the caller and stops the following ones.
+                    self.cmd.returned = Some((ok, v));
+                    return if ok { Ok(v) } else { Err(Fail(rc_text::Component::text(""))) };
+                }
+                sum = sum.wrapping_add(v);
+                got = Some(if single { (ok, v) } else { (true, sum) });
+            }
+            if self.exhausted() {
+                break;
+            }
+        }
+        if ret {
+            // No function returned a result: the caller returns a failure.
+            self.cmd.returned = Some((false, 0));
+            return Err(Fail(rc_text::Component::text("")));
+        }
+        match got {
+            Some((true, v)) => Ok(v),
+            Some((false, _)) => Err(Fail(rc_text::Component::text(""))),
+            None => {
+                self.cmd.flow.no_callback = true;
+                Ok(0)
+            }
+        }
+    }
+
+    /// Macro arguments: SNBT compound, or data of a block, an entity, a storage
+    /// (optional path designating a compound).
+    fn function_arguments(&mut self, s: &Src, p: &Parsed, seg: &Seg) -> Result<Option<Nbt>, Fail> {
+        match seg.path.get(2).map(String::as_str) {
+            Some("<arguments>") => {
+                let text = p.arg(seg, "arguments").unwrap_or_default();
+                Ok(Some(super::snbt::parse(&text).unwrap_or(Nbt::Compound(Vec::new()))))
+            }
+            Some("with") => {
+                let kind = seg.path.get(3).map(String::as_str).unwrap_or("storage");
+                let data = self.data_source(s, p, seg, kind)?;
+                let Some(path) = p.arg(seg, "path") else { return Ok(Some(data.into_owned())) };
+                // Only the compound the path reaches is copied.
+                let found = super::cmds_data::path_find_ref(&data, &path)?;
+                if found.len() > 1 {
+                    return Err(Fail(tr!("commands.data.get.multiple")));
+                }
+                match found[0].as_ref() {
+                    c @ Nbt::Compound(_) => Ok(Some(c.clone())),
+                    other => Err(Fail(tr!("commands.function.error.argument_not_compound", tag_type_name(other)))),
+                }
+            }
+            _ => Ok(None),
+        }
+    }
+
+    fn cmd_schedule(&mut self, s: &Src, p: &Parsed, seg: &Seg) -> R {
+        let a = |n: &str| p.arg(seg, n).unwrap_or_default();
+        if seg.path.get(1).map(String::as_str) == Some("clear") {
+            let id = args::id(&a("function"));
+            let n = self.cmd.scheduled.remove_named(&id);
+            if n == 0 {
+                return Err(Fail(tr!("commands.schedule.cleared.failure", id)));
+            }
+            self.ok(s, tr!("commands.schedule.cleared.success", n, id));
+            return Ok(n as i32);
+        }
+        let (id, shown, key) = self.schedule_target(&a("function"))?;
+        let t = super::cmds_basic::time_ticks(&a("time"));
+        if t == 0 {
+            return Err(Fail(tr!("commands.schedule.same_tick")));
+        }
+        if !id.starts_with('#') && self.cmd.functions.get(&id).is_some_and(|f| f.is_macro()) {
+            return Err(Fail(tr!("commands.schedule.macro")));
+        }
+        let replace = seg.path.get(4).is_none_or(|m| m == "replace");
+        let at = self.time + i64::from(t);
+        if replace {
+            self.cmd.scheduled.remove_named(&id);
+        }
+        self.cmd.scheduled.add(at, id);
+        self.ok(s, tr!(key, shown, t, at));
+        // The game returns the due tick wrapped into 0..2^31-1.
+        Ok(at.rem_euclid(i64::from(i32::MAX)) as i32)
+    }
+
+    /// What `schedule function` waits for, like the game's function argument: a known function or
+    /// any tag; (queue id, identifier shown, message key). The id is complete (`minecraft:`
+    /// added), so `foo` and `minecraft:foo` are the same entry.
+    fn schedule_target(&self, name: &str) -> Result<(String, String, &'static str), Fail> {
+        // The game looks a tag up with an empty list as default, so an unknown tag is accepted
+        // (and runs nothing when due); only an unknown function is refused.
+        if let Some(tag) = name.strip_prefix('#') {
+            let tag = args::id(tag);
+            return Ok((format!("#{tag}"), tag, "commands.schedule.created.tag"));
+        }
+        match self.function_ids(name)? {
+            FunctionIds::One(id) => Ok((id.clone(), id, "commands.schedule.created.function")),
+            FunctionIds::Tag(_) => unreachable!("names without `#` designate one function"),
+        }
+    }
+
+    pub(crate) fn run_scheduled(&mut self) {
+        #[cfg(test)]
+        crate::server::phase(if self.bs.handling_tick { "functions:handling" } else { "functions" });
+        if self.cmd.scheduled.is_empty() {
+            return;
+        }
+        // One due entry at a time, like the game: an entry a due function clears or replaces
+        // before its turn no longer runs; what it schedules is due one tick or more later.
+        while let Some(target) = self.cmd.scheduled.pop_due(self.time) {
+            let src = self.server_source();
+            let _ = self.run_functions(&src, &target, false);
+        }
+    }
+}
+
+/// Value of a macro argument as text: numbers without suffix (floats in decimal, at most 15
+/// digits after the decimal point, never an exponent), raw string, otherwise SNBT.
+fn macro_string(v: &Nbt) -> String {
+    match v {
+        Nbt::Float(f) => java_decimal(f64::from(*f)),
+        Nbt::Double(d) => java_decimal(*d),
+        Nbt::Byte(x) => x.to_string(),
+        Nbt::Short(x) => x.to_string(),
+        Nbt::Long(x) => x.to_string(),
+        Nbt::String(s) => s.clone(),
+        other => super::snbt::to_snbt(other),
+    }
+}
+
+/// The game's decimal format for macros (pattern "#", at most 15 decimals, round half even):
+/// starts from the digits of the shortest representation of the double, like the Java formatter.
+fn java_decimal(x: f64) -> String {
+    if x.is_nan() {
+        return "NaN".into();
+    }
+    if x.is_infinite() {
+        return if x > 0.0 { "\u{221e}".into() } else { "-\u{221e}".into() };
+    }
+    let neg = x.is_sign_negative();
+    let e = format!("{:e}", x.abs());
+    let (mant, exp) = e.split_once('e').unwrap_or((&e, "0"));
+    let exp: i64 = exp.parse().unwrap_or(0);
+    let digits: Vec<u8> = mant.bytes().filter(u8::is_ascii_digit).map(|c| c - b'0').collect();
+    // Value = 0.d1d2… × 10^(exp+1); position of the decimal point in `digits`.
+    let point = exp + 1;
+    // Digits kept: up to 15 after the decimal point.
+    let keep = (point + 15).max(0) as usize;
+    let mut kept: Vec<u8> = digits.iter().copied().take(keep).collect();
+    let mut point = point;
+    if digits.len() > keep {
+        let rest = &digits[keep..];
+        let first = rest[0];
+        let tail_nonzero = rest[1..].iter().any(|&d| d != 0);
+        let last_odd = kept.last().is_some_and(|d| d % 2 == 1);
+        let up = first > 5 || (first == 5 && (tail_nonzero || last_odd));
+        if up {
+            let mut k = kept.len();
+            loop {
+                if k == 0 {
+                    kept.insert(0, 1);
+                    point += 1;
+                    break;
+                }
+                k -= 1;
+                if kept[k] == 9 {
+                    kept[k] = 0;
+                } else {
+                    kept[k] += 1;
+                    break;
+                }
+            }
+        }
+    }
+    let int: String = if point <= 0 {
+        "0".into()
+    } else {
+        (0..point as usize).map(|j| char::from(b'0' + kept.get(j).copied().unwrap_or(0))).collect()
+    };
+    let frac: String =
+        (point..kept.len() as i64).map(|j| if j < 0 { '0' } else { char::from(b'0' + kept[j as usize]) }).collect();
+    let frac = frac.trim_end_matches('0');
+    let mut s = String::new();
+    if neg {
+        s.push('-');
+    }
+    s.push_str(&int);
+    if !frac.is_empty() {
+        s.push('.');
+        s.push_str(frac);
+    }
+    s
+}
+
+/// Name of an NBT tag type as the game displays it (`TAG_Compound`…).
+fn tag_type_name(v: &Nbt) -> &'static str {
+    match v {
+        Nbt::Byte(_) => "TAG_Byte",
+        Nbt::Short(_) => "TAG_Short",
+        Nbt::Int(_) => "TAG_Int",
+        Nbt::Long(_) => "TAG_Long",
+        Nbt::Float(_) => "TAG_Float",
+        Nbt::Double(_) => "TAG_Double",
+        Nbt::ByteArray(_) => "TAG_Byte_Array",
+        Nbt::String(_) => "TAG_String",
+        Nbt::List(_) => "TAG_List",
+        Nbt::Compound(_) => "TAG_Compound",
+        Nbt::IntArray(_) => "TAG_Int_Array",
+        Nbt::LongArray(_) => "TAG_Long_Array",
+    }
+}
+
+#[cfg(test)]
+mod macro_tests {
+    use super::*;
+
+    #[test]
+    fn decimal_like_java() {
+        assert_eq!(java_decimal(1.0), "1");
+        assert_eq!(java_decimal(-2.5), "-2.5");
+        assert_eq!(java_decimal(0.0), "0");
+        assert_eq!(java_decimal(-0.0), "-0");
+        assert_eq!(java_decimal(f64::from(0.1f32)), "0.100000001490116");
+        assert_eq!(java_decimal(1e20), "100000000000000000000");
+        assert_eq!(java_decimal(2f64.powi(70)), "1180591620717411300000");
+        assert_eq!(java_decimal(1e-16), "0");
+        assert_eq!(java_decimal(-1e-16), "-0");
+        assert_eq!(java_decimal(0.000123), "0.000123");
+        assert_eq!(java_decimal(0.9999999999999999), "1");
+        assert_eq!(java_decimal(123.456), "123.456");
+    }
+
+    #[test]
+    fn template_parse_and_substitute() {
+        use super::super::functions::Template;
+        let t = Template::parse("say $(a) and $(b_2)!").unwrap();
+        assert_eq!(t.vars, ["a", "b_2"]);
+        assert_eq!(t.substitute(["1", "x"]), "say 1 and x!");
+        assert!(Template::parse("say nothing").is_err());
+        assert!(Template::parse("say $(a").is_err());
+        assert!(Template::parse("say $(a-b)").is_err());
+        assert_eq!(Template::parse("$(x)").unwrap().substitute(["kill"]), "kill");
+        // `$` alone: text kept.
+        assert_eq!(Template::parse("say 5$ $(x)").unwrap().substitute(["y"]), "say 5$ y");
+        // A variable used twice takes the same value at both places.
+        assert_eq!(Template::parse("$(v) $(v)").unwrap().substitute(["a", "a"]), "a a");
+    }
+
+    #[test]
+    fn macro_values() {
+        assert_eq!(macro_string(&Nbt::Byte(3)), "3");
+        assert_eq!(macro_string(&Nbt::Long(-7)), "-7");
+        assert_eq!(macro_string(&Nbt::String("a b".into())), "a b");
+        assert_eq!(macro_string(&Nbt::Int(12)), "12");
+        assert_eq!(macro_string(&Nbt::Compound(vec![("k".into(), Nbt::Int(1))])), "{k:1}");
+    }
+}
