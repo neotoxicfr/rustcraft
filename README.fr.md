@@ -33,7 +33,7 @@ de cette liste.
 | Fidélité au jeu officiel | **132 missions d'audit sur 157** corrigées et intégrées ; il en reste 25, soit environ 170 écarts moyens (visibles mais rares), plus des détails mineurs notés pour plus tard |
 | Optimisation | **133 missions sur 236** de la passe d'optimisation en cours faites, chacune mesurée |
 | Tests | environ **4 500** tests automatiques, dont beaucoup comparés bit à bit avec le jeu officiel |
-| Conversion des anciens mondes | commencée : les données sauvegardées par la 26.2 ou après sont converties à la lecture ; un tronçon sauvegardé par une version plus ancienne n'est jamais écrasé et sa zone reste vide |
+| Conversion des anciens mondes | commencée : les données sauvegardées par la 26.2 sont converties en 26.3 à la lecture ; un tronçon sauvegardé par une version plus ancienne n'est jamais écrasé et sa zone reste vide |
 | Narrateur, packs de shaders | prévus, pas commencés |
 | Distance de rendu au-delà de 32 chunks, terrain lointain | prévus en options supplémentaires, désactivées par défaut ; pas commencés |
 | macOS | prévu en dernier |

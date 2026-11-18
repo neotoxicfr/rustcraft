@@ -33,7 +33,7 @@ numbers below come from that list.
 | Fidelity to the official game | **132 of 157** audit missions fixed and merged; 25 left, holding about 170 medium differences (noticeable but rare), plus minor details listed for later |
 | Performance work | **133 of 236** missions of the current optimisation pass done, each one measured |
 | Tests | about **4,500** automated tests, many of them compared bit for bit with the official game |
-| Conversion of older worlds | started: data saved by 26.2 or later is converted as it is read; a chunk saved by an older version is never overwritten and its area stays empty |
+| Conversion of older worlds | started: data saved by 26.2 is converted to 26.3 as it is read; a chunk saved by an older version is never overwritten and its area stays empty |
 | Narrator, shader packs | planned, not started |
 | Render distance beyond 32 chunks, distant terrain | planned as extra options, off by default; not started |
 | macOS | planned last |
