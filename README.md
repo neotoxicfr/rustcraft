@@ -33,7 +33,7 @@ numbers below come from that list.
 | Fidelity to the official game | **132 of 157** audit missions fixed and merged; 25 left, holding about 170 medium differences (noticeable but rare), plus minor details listed for later |
 | Performance work | **133 of 236** missions of the current optimisation pass done, each one measured |
 | Tests | about **4,500** automated tests, many of them compared bit for bit with the official game |
-| Conversion of older worlds | started: worlds saved by 26.2 are converted as they open; older ones not yet |
+| Conversion of older worlds | started: data saved by 26.2 or later is converted as it is read; a chunk saved by an older version is never overwritten and its area stays empty |
 | Narrator, shader packs | planned, not started |
 | Render distance beyond 32 chunks, distant terrain | planned as extra options, off by default; not started |
 | macOS | planned last |
@@ -81,7 +81,8 @@ movement and collisions, the damage chain, hunger, generic menu clicks, attribut
   there is no OpenGL fallback, so older integrated GPUs fall back to software rendering.
 - No **narrator**, no **shader packs**, and resource packs that replace the game's core shaders are
   not supported.
-- Worlds saved by **versions older than 26.2** are not converted yet; open them with 26.3 first.
+- Data saved by **versions older than 26.2** is not converted yet: open such a world with 26.3 and
+  run "Optimize World" there first (opening it alone converts only the chunks it reads).
 - No render distance beyond **32 chunks** and no distant terrain yet: both are planned as extra
   options, off by default (the official game stops at 32).
 - The **dedicated server** is planned, after the client. To install and run Minecraft servers from

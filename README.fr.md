@@ -33,7 +33,7 @@ de cette liste.
 | Fidélité au jeu officiel | **132 missions d'audit sur 157** corrigées et intégrées ; il en reste 25, soit environ 170 écarts moyens (visibles mais rares), plus des détails mineurs notés pour plus tard |
 | Optimisation | **133 missions sur 236** de la passe d'optimisation en cours faites, chacune mesurée |
 | Tests | environ **4 500** tests automatiques, dont beaucoup comparés bit à bit avec le jeu officiel |
-| Conversion des anciens mondes | commencée : les mondes sauvegardés par la 26.2 sont convertis à l'ouverture ; les plus anciens pas encore |
+| Conversion des anciens mondes | commencée : les données sauvegardées par la 26.2 ou après sont converties à la lecture ; un tronçon sauvegardé par une version plus ancienne n'est jamais écrasé et sa zone reste vide |
 | Narrateur, packs de shaders | prévus, pas commencés |
 | Distance de rendu au-delà de 32 chunks, terrain lointain | prévus en options supplémentaires, désactivées par défaut ; pas commencés |
 | macOS | prévu en dernier |
@@ -84,7 +84,9 @@ d'attributs des infobulles.
   rendu logiciel.
 - Pas de **narrateur**, pas de **packs de shaders**, et les packs de ressources qui remplacent les
   shaders du jeu ne sont pas pris en charge.
-- Les mondes des **versions antérieures à la 26.2** ne sont pas encore convertis : ouvre-les d'abord avec la 26.3.
+- Les données des **versions antérieures à la 26.2** ne sont pas encore converties : ouvre un tel
+  monde avec la 26.3 et lances-y d'abord « Optimiser le monde » (l'ouvrir seulement ne convertit que
+  les tronçons lus).
 - Pas de distance de rendu au-delà de **32 chunks** ni de terrain lointain pour l'instant : les deux
   sont prévus en options supplémentaires, désactivées par défaut (le jeu officiel s'arrête à 32).
 - Le **serveur dédié** est prévu, après le client. Pour installer et piloter dès aujourd'hui des
