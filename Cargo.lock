@@ -1008,9 +1008,9 @@ dependencies = [
 
 [[package]]
 name = "hashbrown"
-version = "0.17.1"
+version = "0.17.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a"
+checksum = "735eaa21a6a5ffb2e84362faaeb90c05ba8e19797ca30428478cb6ea3a4921bc"
 dependencies = [
  "allocator-api2",
  "equivalent",
@@ -1065,7 +1065,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cc4e190f5d26ca7051642629da2c52fc03bde85a03197c99408dcd291734c855"
 dependencies = [
  "equivalent",
- "hashbrown 0.17.1",
+ "hashbrown 0.17.2",
 ]
 
 [[package]]
@@ -1366,7 +1366,7 @@ dependencies = [
  "cfg_aliases",
  "codespan-reporting",
  "half",
- "hashbrown 0.17.1",
+ "hashbrown 0.17.2",
  "indexmap",
  "libm",
  "log",
@@ -1385,7 +1385,7 @@ version = "30.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "590afbf58a6f4f62873cd5cff4468061844bafa1cdf399cc954537c22d768d49"
 dependencies = [
- "hashbrown 0.17.1",
+ "hashbrown 0.17.2",
  "indexmap",
  "rustc-hash",
  "thiserror 2.0.21",
@@ -2043,9 +2043,9 @@ dependencies = [
 
 [[package]]
 name = "pollster"
-version = "1.0.1"
+version = "1.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bc6355899e1c9462875b6757c79f3caa011a1fdae12bbb1a2e72dd1f234f8336"
+checksum = "7e9b9cf600136f5b976fbc5727d58c26e1ecab8ee23088d44ef1c7af793550ab"
 
 [[package]]
 name = "portable-atomic"
@@ -2220,7 +2220,7 @@ dependencies = [
  "crossbeam-channel",
  "foldhash",
  "glam",
- "hashbrown 0.17.1",
+ "hashbrown 0.17.2",
  "libmimalloc-sys",
  "log",
  "mimalloc",
@@ -2259,7 +2259,7 @@ version = "0.1.0"
 dependencies = [
  "ab_glyph_rasterizer",
  "flate2",
- "hashbrown 0.17.1",
+ "hashbrown 0.17.2",
  "mimalloc",
  "png",
  "rayon",
@@ -2277,7 +2277,7 @@ version = "0.1.0"
 dependencies = [
  "cpal",
  "crossbeam-channel",
- "hashbrown 0.17.1",
+ "hashbrown 0.17.2",
  "lewton",
  "rayon",
  "rc-assets",
@@ -2306,7 +2306,7 @@ dependencies = [
  "base64",
  "crossbeam-channel",
  "getrandom 0.4.3",
- "hashbrown 0.17.1",
+ "hashbrown 0.17.2",
  "ipconfig",
  "md-5",
  "mimalloc",
@@ -2332,7 +2332,7 @@ dependencies = [
 name = "rc-commands"
 version = "0.1.0"
 dependencies = [
- "hashbrown 0.17.1",
+ "hashbrown 0.17.2",
  "rc-data",
  "rc-proto",
  "rc-proto-v777",
@@ -2345,7 +2345,7 @@ version = "0.1.0"
 dependencies = [
  "criterion",
  "fancy-regex",
- "hashbrown 0.17.1",
+ "hashbrown 0.17.2",
  "memmap2",
  "mimalloc",
  "rayon",
@@ -2377,7 +2377,7 @@ name = "rc-light"
 version = "0.1.0"
 dependencies = [
  "criterion",
- "hashbrown 0.17.1",
+ "hashbrown 0.17.2",
  "mimalloc",
  "rayon",
  "rc-data",
@@ -2393,7 +2393,7 @@ version = "0.1.0"
 dependencies = [
  "bytemuck",
  "criterion",
- "hashbrown 0.17.1",
+ "hashbrown 0.17.2",
  "libdeflater",
  "mimalloc",
  "pollster",
@@ -2426,7 +2426,7 @@ dependencies = [
 name = "rc-physics"
 version = "0.1.0"
 dependencies = [
- "hashbrown 0.17.1",
+ "hashbrown 0.17.2",
  "rc-data",
  "rc-testdata",
 ]
@@ -2462,7 +2462,7 @@ dependencies = [
  "crossbeam-channel",
  "flate2",
  "getrandom 0.4.3",
- "hashbrown 0.17.1",
+ "hashbrown 0.17.2",
  "libdeflater",
  "mimalloc",
  "rand_core 0.10.1",
@@ -2502,7 +2502,7 @@ dependencies = [
 name = "rc-text"
 version = "0.1.0"
 dependencies = [
- "hashbrown 0.17.1",
+ "hashbrown 0.17.2",
  "rc-data",
  "rc-proto",
  "serde_json",
@@ -2522,7 +2522,7 @@ name = "rc-worldgen"
 version = "0.1.0"
 dependencies = [
  "flate2",
- "hashbrown 0.17.1",
+ "hashbrown 0.17.2",
  "md-5",
  "mimalloc",
  "rayon",
@@ -2920,9 +2920,9 @@ checksum = "0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5"
 
 [[package]]
 name = "smallvec"
-version = "1.16.5"
+version = "1.16.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "149309498a5f7334b12ddae0cad8aba81ce785fe91755068867e017cf98fee46"
+checksum = "3244542535d5de959d90ec55d1b5ff0fd2bb7b1310223907d5f11932847f7b59"
 
 [[package]]
 name = "smithay-client-toolkit"
@@ -3610,7 +3610,7 @@ dependencies = [
  "cfg-if",
  "cfg_aliases",
  "document-features",
- "hashbrown 0.17.1",
+ "hashbrown 0.17.2",
  "js-sys",
  "log",
  "parking_lot",
@@ -3640,7 +3640,7 @@ dependencies = [
  "bytemuck",
  "cfg_aliases",
  "document-features",
- "hashbrown 0.17.1",
+ "hashbrown 0.17.2",
  "indexmap",
  "log",
  "naga",
@@ -3694,7 +3694,7 @@ dependencies = [
  "cfg-if",
  "cfg_aliases",
  "gpu-allocator",
- "hashbrown 0.17.1",
+ "hashbrown 0.17.2",
  "libc",
  "libloading",
  "log",
@@ -4190,9 +4190,9 @@ dependencies = [
 
 [[package]]
 name = "zip"
-version = "9.6.0"
+version = "9.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "80cc68510ea7553c30a69c732de5278e94183f68765af6c642dbccefd6ec777e"
+checksum = "a9534624d547e3f516ecde0ed9a70d37788f01d340efcfdd03bf3ea8e163c1d0"
 dependencies = [
  "constant_time_eq",
  "crc32fast",
